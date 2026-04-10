@@ -59,13 +59,6 @@
           default = picoclaw;
         }
         // nixpkgs.lib.optionalAttrs pkgs.stdenv.isLinux {
-          devShell = pkgs.mkShell {
-
-            packages = with pkgs; [
-                pinact
-
-                        ];
-                    };
           docker = pkgs.dockerTools.buildImage {
             name = "picoclaw-copilot";
             tag = "latest";
@@ -77,6 +70,7 @@
                 pkgs.git
                 pkgs.openssh
                 pkgs.gh
+                pkgs.copilot-cli
                 pkgs.cacert
                 pkgs.bashInteractive
                 pkgs.coreutils
