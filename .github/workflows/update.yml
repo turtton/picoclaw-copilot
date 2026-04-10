@@ -18,7 +18,7 @@ jobs:
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
 
       - name: Check for new release
         id: check
@@ -55,7 +55,7 @@ jobs:
 
       - name: Install Nix
         if: steps.check.outputs.update_needed == 'true'
-        uses: DeterminateSystems/nix-installer-action@v17
+        uses: DeterminateSystems/nix-installer-action@v22
 
       - name: Update version and hashes
         if: steps.check.outputs.update_needed == 'true'
