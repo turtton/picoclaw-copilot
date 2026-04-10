@@ -19,8 +19,10 @@
 
 ```bash
 docker pull ghcr.io/turtton/picoclaw-copilot:latest
-docker run --rm ghcr.io/turtton/picoclaw-copilot picoclaw --version
+docker run --rm ghcr.io/turtton/picoclaw-copilot version
 ```
+
+`ENTRYPOINT` が `picoclaw` に設定されているため、引数はそのまま picoclaw のサブコマンド/フラグとして渡されます。
 
 ## ローカルビルド
 

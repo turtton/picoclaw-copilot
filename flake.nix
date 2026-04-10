@@ -59,6 +59,13 @@
           default = picoclaw;
         }
         // nixpkgs.lib.optionalAttrs pkgs.stdenv.isLinux {
+          devShell = pkgs.mkShell {
+
+            packages = with pkgs; [
+                pinact
+
+                        ];
+                    };
           docker = pkgs.dockerTools.buildImage {
             name = "picoclaw-copilot";
             tag = "latest";
@@ -84,7 +91,7 @@
             '';
 
             config = {
-              Cmd = [ "picoclaw" ];
+              Entrypoint = [ "picoclaw" ];
               Env = [
                 "HOME=/root"
                 "TMPDIR=/tmp"
