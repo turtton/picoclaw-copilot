@@ -1,0 +1,111 @@
+name: Update picoclaw version
+
+on:
+  schedule:
+    - cron: "0 0 * * *"
+  workflow_dispatch:
+
+concurrency:
+  group: update-picoclaw
+  cancel-in-progress: false
+
+jobs:
+  check-update:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      actions: write
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Check for new release
+        id: check
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          LATEST_TAG=$(gh release view --repo sipeed/picoclaw --json tagName --jq .tagName 2>/dev/null || echo "")
+          if [ -z "$LATEST_TAG" ]; then
+            echo "No stable release found"
+            echo "update_needed=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # Validate tag format (must be v<semver>, strict)
+          if ! echo "$LATEST_TAG" | grep -qP '^v[0-9]+\.[0-9]+\.[0-9]+$'; then
+            echo "::warning::Unexpected tag format: $LATEST_TAG"
+            echo "update_needed=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          LATEST_VERSION="${LATEST_TAG#v}"
+          CURRENT_VERSION=$(grep -oP 'version = "\K[^"]+' flake.nix)
+
+          echo "latest=$LATEST_VERSION" >> "$GITHUB_OUTPUT"
+          echo "current=$CURRENT_VERSION" >> "$GITHUB_OUTPUT"
+
+          if [ "$LATEST_VERSION" != "$CURRENT_VERSION" ]; then
+            echo "update_needed=true" >> "$GITHUB_OUTPUT"
+            echo "New version available: v$LATEST_VERSION (current: v$CURRENT_VERSION)"
+          else
+            echo "update_needed=false" >> "$GITHUB_OUTPUT"
+            echo "Already up to date: v$CURRENT_VERSION"
+          fi
+
+      - name: Install Nix
+        if: steps.check.outputs.update_needed == 'true'
+        uses: DeterminateSystems/nix-installer-action@v17
+
+      - name: Update version and hashes
+        if: steps.check.outputs.update_needed == 'true'
+        env:
+          NEW_VERSION: ${{ steps.check.outputs.latest }}
+        run: |
+          set -euo pipefail
+
+          # Update version
+          sed -i "s/version = \".*\"/version = \"$NEW_VERSION\"/" flake.nix
+
+          # Update source hash
+          echo "Fetching source hash for v${NEW_VERSION}..."
+          SRC_HASH=$(nix-prefetch-url --unpack "https://github.com/sipeed/picoclaw/archive/refs/tags/v${NEW_VERSION}.tar.gz")
+          SRI_SRC_HASH=$(nix hash to-sri --type sha256 "$SRC_HASH")
+          echo "Source hash: $SRI_SRC_HASH"
+          sed -i "s|hash = \"sha256-[^\"]*\"|hash = \"$SRI_SRC_HASH\"|" flake.nix
+
+          # Update vendorHash by triggering a build with a dummy hash
+          echo "Determining vendorHash..."
+          sed -i 's|vendorHash = "sha256-[^"]*"|vendorHash = "sha256-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="|' flake.nix
+          BUILD_OUTPUT=$(nix build .#picoclaw 2>&1 || true)
+          VENDOR_HASH=$(echo "$BUILD_OUTPUT" | grep -oP 'got:\s+\Ksha256-[A-Za-z0-9+/=]+' || true)
+          if [ -n "$VENDOR_HASH" ]; then
+            echo "Vendor hash: $VENDOR_HASH"
+            sed -i "s|vendorHash = \"sha256-[^\"]*\"|vendorHash = \"$VENDOR_HASH\"|" flake.nix
+          else
+            echo "::error::Failed to determine vendorHash. Build output:"
+            echo "$BUILD_OUTPUT"
+            exit 1
+          fi
+
+      - name: Verify build
+        if: steps.check.outputs.update_needed == 'true'
+        run: nix build .#picoclaw
+
+      - name: Commit and push
+        if: steps.check.outputs.update_needed == 'true'
+        env:
+          NEW_VERSION: ${{ steps.check.outputs.latest }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add flake.nix flake.lock
+          git diff --staged --quiet && { echo "No changes to commit"; exit 0; }
+          git commit -m "chore: update picoclaw to v${NEW_VERSION}"
+          git push
+
+      - name: Trigger build workflow
+        if: steps.check.outputs.update_needed == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: gh workflow run build.yml --ref main

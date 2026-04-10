@@ -1,0 +1,89 @@
+name: Build and Push Docker Image
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Nix
+        uses: DeterminateSystems/nix-installer-action@v17
+
+      - name: Setup Nix cache
+        uses: DeterminateSystems/magic-nix-cache-action@v8
+
+      - name: Build Docker image
+        run: nix build .#docker
+
+      - name: Prepare image artifact
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        run: cp --dereference result docker-image.tar.gz
+
+      - name: Upload image artifact
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        uses: actions/upload-artifact@v4
+        with:
+          name: docker-image
+          path: docker-image.tar.gz
+          if-no-files-found: error
+          retention-days: 1
+
+  push:
+    needs: build
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Download image artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: docker-image
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Push image to GHCR
+        run: |
+          IMAGE_ID="${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}"
+          IMAGE_ID=$(echo "$IMAGE_ID" | tr '[:upper:]' '[:lower:]')
+
+          LOADED=$(docker load < docker-image.tar.gz)
+          IMAGE_REF=$(echo "$LOADED" | grep -oP 'Loaded image: \K.*')
+          docker tag "$IMAGE_REF" "$IMAGE_ID:latest"
+          docker tag "$IMAGE_REF" "$IMAGE_ID:${{ github.sha }}"
+
+          VERSION=$(grep -oP 'version = "\K[^"]+' flake.nix)
+          docker tag "$IMAGE_REF" "$IMAGE_ID:v${VERSION}"
+
+          docker push "$IMAGE_ID:latest"
+          docker push "$IMAGE_ID:${{ github.sha }}"
+          docker push "$IMAGE_ID:v${VERSION}"
