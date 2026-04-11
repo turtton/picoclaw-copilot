@@ -4,7 +4,7 @@
 
 ## カスタマイズ内容
 
-- `/clear` コマンドを Discord スラッシュコマンドとして登録（テキストコマンドも引き続き動作）
+- 全ビルトインコマンド（start, help, show, list, use, switch, check, clear, subagents, reload）を Discord スラッシュコマンドとして登録（テキストコマンドも引き続き動作）
 
 ## 含まれるパッケージ
 

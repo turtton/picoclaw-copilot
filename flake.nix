@@ -34,7 +34,7 @@
             };
 
             patches = [
-              ./patches/0001-add-clear-slash-command.patch
+              ./patches/0001-add-slash-commands.patch
             ];
 
             vendorHash = "sha256-vUJBeB2FiV1frc+CW3Q7Lxkfon9oaV/7QPDTMRu7NrY=";

@@ -1,0 +1,192 @@
+diff --git a/pkg/channels/discord/discord.go b/pkg/channels/discord/discord.go
+index 01b1b40..de5ef78 100644
+--- a/pkg/channels/discord/discord.go
++++ b/pkg/channels/discord/discord.go
+@@ -103,6 +103,7 @@ func (c *DiscordChannel) Start(ctx context.Context) error {
+ 	c.botUserID = botUser.ID
+ 
+ 	c.session.AddHandler(c.handleMessage)
++	c.session.AddHandler(c.handleInteraction)
+ 
+ 	go c.listenVoiceControl(c.ctx)
+ 
+@@ -110,6 +111,73 @@ func (c *DiscordChannel) Start(ctx context.Context) error {
+ 		return fmt.Errorf("failed to open discord session: %w", err)
+ 	}
+ 
++	_, err = c.session.ApplicationCommandBulkOverwrite(c.botUserID, "", []*discordgo.ApplicationCommand{
++		{Name: "start", Description: "Start the bot"},
++		{Name: "help", Description: "Show help message"},
++		{
++			Name:        "show",
++			Description: "Show current configuration",
++			Options: []*discordgo.ApplicationCommandOption{
++				{Type: discordgo.ApplicationCommandOptionSubCommand, Name: "model", Description: "Current model and provider"},
++				{Type: discordgo.ApplicationCommandOptionSubCommand, Name: "channel", Description: "Current channel"},
++				{Type: discordgo.ApplicationCommandOptionSubCommand, Name: "agents", Description: "Registered agents"},
++			},
++		},
++		{
++			Name:        "list",
++			Description: "List available options",
++			Options: []*discordgo.ApplicationCommandOption{
++				{Type: discordgo.ApplicationCommandOptionSubCommand, Name: "models", Description: "Configured models"},
++				{Type: discordgo.ApplicationCommandOptionSubCommand, Name: "channels", Description: "Enabled channels"},
++				{Type: discordgo.ApplicationCommandOptionSubCommand, Name: "agents", Description: "Registered agents"},
++				{Type: discordgo.ApplicationCommandOptionSubCommand, Name: "skills", Description: "Installed skills"},
++			},
++		},
++		{
++			Name:        "use",
++			Description: "Force a specific installed skill for one request",
++			Options: []*discordgo.ApplicationCommandOption{
++				{Type: discordgo.ApplicationCommandOptionString, Name: "skill", Description: "Skill name to use", Required: true},
++				{Type: discordgo.ApplicationCommandOptionString, Name: "message", Description: "Message to send with the skill", Required: false},
++			},
++		},
++		{
++			Name:        "switch",
++			Description: "Switch model",
++			Options: []*discordgo.ApplicationCommandOption{
++				{
++					Type:        discordgo.ApplicationCommandOptionSubCommand,
++					Name:        "model",
++					Description: "Switch to a different model",
++					Options: []*discordgo.ApplicationCommandOption{
++						{Type: discordgo.ApplicationCommandOptionString, Name: "name", Description: "Model name to switch to", Required: true},
++					},
++				},
++				{Type: discordgo.ApplicationCommandOptionSubCommand, Name: "channel", Description: "Moved to /check channel"},
++			},
++		},
++		{
++			Name:        "check",
++			Description: "Check channel availability",
++			Options: []*discordgo.ApplicationCommandOption{
++				{
++					Type:        discordgo.ApplicationCommandOptionSubCommand,
++					Name:        "channel",
++					Description: "Check if a channel is available",
++					Options: []*discordgo.ApplicationCommandOption{
++						{Type: discordgo.ApplicationCommandOptionString, Name: "name", Description: "Channel name to check", Required: true},
++					},
++				},
++			},
++		},
++		{Name: "clear", Description: "Clear the chat history"},
++		{Name: "subagents", Description: "Show running subagents and task tree"},
++		{Name: "reload", Description: "Reload the configuration file"},
++	})
++	if err != nil {
++		logger.WarnCF("discord", "Failed to register slash commands", map[string]any{"error": err.Error()})
++	}
++
+ 	c.SetRunning(true)
+ 
+ 	logger.InfoCF("discord", "Discord bot connected", map[string]any{
+@@ -520,6 +588,105 @@ func (c *DiscordChannel) handleMessage(s *discordgo.Session, m *discordgo.Messag
+ 	c.HandleMessage(c.ctx, peer, m.ID, senderID, m.ChannelID, content, mediaPaths, metadata, sender)
+ }
+ 
++func (c *DiscordChannel) handleInteraction(s *discordgo.Session, i *discordgo.InteractionCreate) {
++	if i.Type != discordgo.InteractionApplicationCommand {
++		return
++	}
++
++	data := i.ApplicationCommandData()
++
++	user := i.User
++	if user == nil && i.Member != nil {
++		user = i.Member.User
++	}
++	if user == nil {
++		logger.WarnCF("discord", "Received interaction with no user information", map[string]any{"interaction_id": i.ID, "command": data.Name})
++		return
++	}
++
++	sender := bus.SenderInfo{
++		Platform:    "discord",
++		PlatformID:  user.ID,
++		CanonicalID: identity.BuildCanonicalID("discord", user.ID),
++		Username:    user.Username,
++		DisplayName: user.Username,
++	}
++
++	if !c.IsAllowedSender(sender) {
++		if err := c.session.InteractionRespond(i.Interaction, &discordgo.InteractionResponse{
++			Type: discordgo.InteractionResponseChannelMessageWithSource,
++			Data: &discordgo.InteractionResponseData{
++				Content: "You are not allowed to use this command.",
++				Flags:   discordgo.MessageFlagsEphemeral,
++			},
++		}); err != nil {
++			logger.WarnCF("discord", "Failed to respond to unauthorized interaction", map[string]any{"error": err.Error()})
++		}
++		return
++	}
++
++	channelID := i.ChannelID
++	senderID := user.ID
++
++	peerKind := "channel"
++	peerID := channelID
++	if i.GuildID == "" {
++		peerKind = "direct"
++		peerID = senderID
++	}
++
++	peer := bus.Peer{Kind: peerKind, ID: peerID}
++
++	metadata := map[string]string{
++		"user_id":        senderID,
++		"username":       user.Username,
++		"display_name":   sender.DisplayName,
++		"guild_id":       i.GuildID,
++		"channel_id":     channelID,
++		"is_dm":          fmt.Sprintf("%t", i.GuildID == ""),
++		"interaction_id": i.ID,
++	}
++
++	textCommand := "/" + data.Name
++	for _, opt := range data.Options {
++		if opt.Type == discordgo.ApplicationCommandOptionSubCommand {
++			textCommand += " " + opt.Name
++			for _, subOpt := range opt.Options {
++				if subOpt.Type != discordgo.ApplicationCommandOptionString {
++					continue
++				}
++				if data.Name == "switch" && opt.Name == "model" {
++					textCommand += " to " + subOpt.StringValue()
++					continue
++				}
++				textCommand += " " + subOpt.StringValue()
++			}
++			continue
++		}
++		if opt.Type == discordgo.ApplicationCommandOptionString {
++			textCommand += " " + opt.StringValue()
++		}
++	}
++
++	ackMessage := "Processing /" + data.Name + "..."
++	if data.Name == "clear" {
++		ackMessage = "Clearing chat history..."
++	}
++
++	if err := c.session.InteractionRespond(i.Interaction, &discordgo.InteractionResponse{
++		Type: discordgo.InteractionResponseChannelMessageWithSource,
++		Data: &discordgo.InteractionResponseData{
++			Content: ackMessage,
++			Flags:   discordgo.MessageFlagsEphemeral,
++		},
++	}); err != nil {
++		logger.WarnCF("discord", "Failed to acknowledge interaction", map[string]any{"error": err.Error(), "command": textCommand})
++		return
++	}
++
++	c.HandleMessage(c.ctx, peer, "", senderID, channelID, textCommand, nil, metadata, sender)
++}
++
+ // startTyping starts a continuous typing indicator loop for the given chatID.
+ // It stops any existing typing loop for that chatID before starting a new one.
+ func (c *DiscordChannel) startTyping(chatID string) {
