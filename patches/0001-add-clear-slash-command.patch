@@ -1,5 +1,5 @@
 diff --git a/pkg/channels/discord/discord.go b/pkg/channels/discord/discord.go
-index 01b1b40..9da9058 100644
+index 01b1b40..8fcf921 100644
 --- a/pkg/channels/discord/discord.go
 +++ b/pkg/channels/discord/discord.go
 @@ -103,6 +103,7 @@ func (c *DiscordChannel) Start(ctx context.Context) error {
@@ -10,22 +10,24 @@ index 01b1b40..9da9058 100644
  
  	go c.listenVoiceControl(c.ctx)
  
-@@ -110,6 +111,14 @@ func (c *DiscordChannel) Start(ctx context.Context) error {
+@@ -110,6 +111,16 @@ func (c *DiscordChannel) Start(ctx context.Context) error {
  		return fmt.Errorf("failed to open discord session: %w", err)
  	}
  
-+	_, err = c.session.ApplicationCommandCreate(c.botUserID, "", &discordgo.ApplicationCommand{
-+		Name:        "clear",
-+		Description: "Clear the chat history",
++	_, err = c.session.ApplicationCommandBulkOverwrite(c.botUserID, "", []*discordgo.ApplicationCommand{
++		{
++			Name:        "clear",
++			Description: "Clear the chat history",
++		},
 +	})
 +	if err != nil {
-+		logger.WarnCF("discord", "Failed to register /clear slash command", map[string]any{"error": err.Error()})
++		logger.WarnCF("discord", "Failed to register slash commands", map[string]any{"error": err.Error()})
 +	}
 +
  	c.SetRunning(true)
  
  	logger.InfoCF("discord", "Discord bot connected", map[string]any{
-@@ -520,6 +529,82 @@ func (c *DiscordChannel) handleMessage(s *discordgo.Session, m *discordgo.Messag
+@@ -520,6 +531,82 @@ func (c *DiscordChannel) handleMessage(s *discordgo.Session, m *discordgo.Messag
  	c.HandleMessage(c.ctx, peer, m.ID, senderID, m.ChannelID, content, mediaPaths, metadata, sender)
  }
  
