@@ -1,6 +1,10 @@
 # picoclaw-copilot
 
-[picoclaw](https://github.com/sipeed/picoclaw) のカスタム Docker イメージ。Nix flake でビルドし、GitHub Actions で GHCR に自動公開します。
+[picoclaw](https://github.com/sipeed/picoclaw) の soft-fork ディストリビューション。パッチベースでカスタマイズを行い、Nix flake でビルドし、GitHub Actions で GHCR に自動公開します。
+
+## カスタマイズ内容
+
+- `/clear` コマンドを Discord スラッシュコマンドとして登録（テキストコマンドも引き続き動作）
 
 ## 含まれるパッケージ
 
@@ -29,15 +33,22 @@ docker run --rm ghcr.io/turtton/picoclaw-copilot version
 [Nix](https://nixos.org/) が必要です。
 
 ```bash
-# picoclaw バイナリのみ
 nix build .#picoclaw
-
-# Docker イメージ (Linux のみ)
 nix build .#docker
 docker load < result
+```
+
+## パッチ開発
+
+```bash
+./scripts/fetch-upstream.sh
+./scripts/apply-patches.sh
+
+# .upstream/ 内で変更を加えた後:
+./scripts/create-patch.sh 0002-my-change
 ```
 
 ## CI/CD
 
 - **Build and Push** (`build.yml`): `main` への push 時に Docker イメージをビルドし GHCR に公開
-- **Update** (`update.yml`): 毎日 upstream の新バージョンをチェックし、自動で `flake.nix` を更新・コミット
+- **Update** (`update.yml`): 毎日 upstream の新バージョンをチェックし、自動で `flake.nix` と `.upstream-version` を更新・コミット。パッチが新バージョンに適用できない場合はビルドが失敗します

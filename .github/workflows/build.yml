@@ -52,7 +52,7 @@ jobs:
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     permissions:
-      contents: read
+      contents: write
       packages: write
 
     steps:
@@ -71,6 +71,21 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
+      - name: Determine version tag
+        id: version
+        run: |
+          UPSTREAM_VERSION=$(grep -oP 'version = "\K[^"]+' flake.nix)
+          echo "upstream=${UPSTREAM_VERSION}" >> "$GITHUB_OUTPUT"
+
+          # Determine copilot revision from existing git tags
+          git fetch --tags --quiet
+          EXISTING=$(git tag -l "${UPSTREAM_VERSION}-*" | grep -oP "^${UPSTREAM_VERSION}-\K[0-9]+" | sort -n | tail -1 || true)
+
+          COPILOT_REV=$(( ${EXISTING:-0} + 1 ))
+          COPILOT_VERSION="${UPSTREAM_VERSION}-${COPILOT_REV}"
+          echo "copilot=${COPILOT_VERSION}" >> "$GITHUB_OUTPUT"
+          echo "Version: ${COPILOT_VERSION}"
+
       - name: Push image to GHCR
         run: |
           IMAGE_ID="${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}"
@@ -80,10 +95,15 @@ jobs:
           IMAGE_REF=$(echo "$LOADED" | grep -oP 'Loaded image: \K.*')
           docker tag "$IMAGE_REF" "$IMAGE_ID:latest"
           docker tag "$IMAGE_REF" "$IMAGE_ID:${{ github.sha }}"
-
-          VERSION=$(grep -oP 'version = "\K[^"]+' flake.nix)
-          docker tag "$IMAGE_REF" "$IMAGE_ID:v${VERSION}"
+          docker tag "$IMAGE_REF" "$IMAGE_ID:${{ steps.version.outputs.copilot }}"
 
           docker push "$IMAGE_ID:latest"
           docker push "$IMAGE_ID:${{ github.sha }}"
-          docker push "$IMAGE_ID:v${VERSION}"
+          docker push "$IMAGE_ID:${{ steps.version.outputs.copilot }}"
+
+      - name: Create version tag
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git tag "${{ steps.version.outputs.copilot }}" || true
+          git push origin "${{ steps.version.outputs.copilot }}" || true

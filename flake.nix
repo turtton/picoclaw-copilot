@@ -33,6 +33,10 @@
               hash = "sha256-ohqnfBn3CbBrR+ynOVtBsBBCgP7pP2HHzYElbw1Ygf8=";
             };
 
+            patches = [
+              ./patches/0001-add-clear-slash-command.patch
+            ];
+
             vendorHash = "sha256-vUJBeB2FiV1frc+CW3Q7Lxkfon9oaV/7QPDTMRu7NrY=";
             proxyVendor = true;
 
