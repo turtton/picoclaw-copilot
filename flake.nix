@@ -1,10 +1,11 @@
 {
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
+    llm-agents.url = "github:numtide/llm-agents.nix";
   };
 
   outputs =
-    { self, nixpkgs }:
+    { self, nixpkgs, llm-agents }:
     let
       supportedSystems = [
         "x86_64-linux"
@@ -19,6 +20,7 @@
         system:
         let
           pkgs = import nixpkgs { inherit system; };
+          copilot-cli = llm-agents.packages.${system}.copilot-cli;
 
           picoclaw = pkgs.buildGoModule rec {
             pname = "picoclaw";
@@ -70,7 +72,7 @@
                 pkgs.git
                 pkgs.openssh
                 pkgs.gh
-                pkgs.copilot-cli
+                copilot-cli
                 pkgs.cacert
                 pkgs.bashInteractive
                 pkgs.coreutils
