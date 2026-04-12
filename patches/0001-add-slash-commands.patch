@@ -1,5 +1,54 @@
+diff --git a/pkg/bus/types.go b/pkg/bus/types.go
+index 27cf61b..2195c3a 100644
+--- a/pkg/bus/types.go
++++ b/pkg/bus/types.go
+@@ -8,11 +8,12 @@ type Peer struct {
+ 
+ // SenderInfo provides structured sender identity information.
+ type SenderInfo struct {
+-	Platform    string `json:"platform,omitempty"`     // "telegram", "discord", "slack", ...
+-	PlatformID  string `json:"platform_id,omitempty"`  // raw platform ID, e.g. "123456"
+-	CanonicalID string `json:"canonical_id,omitempty"` // "platform:id" format
+-	Username    string `json:"username,omitempty"`     // username (e.g. @alice)
+-	DisplayName string `json:"display_name,omitempty"` // display name
++	Platform      string `json:"platform,omitempty"`     // "telegram", "discord", "slack", ...
++	PlatformID    string `json:"platform_id,omitempty"`  // raw platform ID, e.g. "123456"
++	CanonicalID   string `json:"canonical_id,omitempty"` // "platform:id" format
++	Username      string `json:"username,omitempty"`     // username (e.g. @alice)
++	DisplayName   string `json:"display_name,omitempty"` // display name
++	PreAuthorized bool   `json:"-"`                      // transient: skip allow-list re-check (set by channel-level role auth)
+ }
+ 
+ type InboundMessage struct {
+diff --git a/pkg/channels/base.go b/pkg/channels/base.go
+index bd4ced8..f94143f 100644
+--- a/pkg/channels/base.go
++++ b/pkg/channels/base.go
+@@ -257,13 +257,15 @@ func (c *BaseChannel) HandleMessage(
+ 	if len(senderOpts) > 0 {
+ 		sender = senderOpts[0]
+ 	}
+-	if sender.CanonicalID != "" || sender.PlatformID != "" {
+-		if !c.IsAllowedSender(sender) {
+-			return
+-		}
+-	} else {
+-		if !c.IsAllowed(senderID) {
+-			return
++	if !sender.PreAuthorized {
++		if sender.CanonicalID != "" || sender.PlatformID != "" {
++			if !c.IsAllowedSender(sender) {
++				return
++			}
++		} else {
++			if !c.IsAllowed(senderID) {
++				return
++			}
+ 		}
+ 	}
+ 
 diff --git a/pkg/channels/discord/discord.go b/pkg/channels/discord/discord.go
-index 01b1b40..de5ef78 100644
+index 01b1b40..cccc751 100644
 --- a/pkg/channels/discord/discord.go
 +++ b/pkg/channels/discord/discord.go
 @@ -103,6 +103,7 @@ func (c *DiscordChannel) Start(ctx context.Context) error {
@@ -84,7 +133,26 @@ index 01b1b40..de5ef78 100644
  	c.SetRunning(true)
  
  	logger.InfoCF("discord", "Discord bot connected", map[string]any{
-@@ -520,6 +588,105 @@ func (c *DiscordChannel) handleMessage(s *discordgo.Session, m *discordgo.Messag
+@@ -388,10 +456,14 @@ func (c *DiscordChannel) handleMessage(s *discordgo.Session, m *discordgo.Messag
+ 	sender.DisplayName = displayName
+ 
+ 	if !c.IsAllowedSender(sender) {
+-		logger.DebugCF("discord", "Message rejected by allowlist", map[string]any{
+-			"user_id": m.Author.ID,
+-		})
+-		return
++		if c.isAllowedByRole(m.GuildID, m.Author.ID, m.Member) {
++			sender.PreAuthorized = true
++		} else {
++			logger.DebugCF("discord", "Message rejected by allowlist", map[string]any{
++				"user_id": m.Author.ID,
++			})
++			return
++		}
+ 	}
+ 
+ 	if c.handleVoiceCommand(s, m) {
+@@ -520,6 +592,149 @@ func (c *DiscordChannel) handleMessage(s *discordgo.Session, m *discordgo.Messag
  	c.HandleMessage(c.ctx, peer, m.ID, senderID, m.ChannelID, content, mediaPaths, metadata, sender)
  }
  
@@ -113,16 +181,20 @@ index 01b1b40..de5ef78 100644
 +	}
 +
 +	if !c.IsAllowedSender(sender) {
-+		if err := c.session.InteractionRespond(i.Interaction, &discordgo.InteractionResponse{
-+			Type: discordgo.InteractionResponseChannelMessageWithSource,
-+			Data: &discordgo.InteractionResponseData{
-+				Content: "You are not allowed to use this command.",
-+				Flags:   discordgo.MessageFlagsEphemeral,
-+			},
-+		}); err != nil {
-+			logger.WarnCF("discord", "Failed to respond to unauthorized interaction", map[string]any{"error": err.Error()})
++		if c.isAllowedByRole(i.GuildID, user.ID, i.Member) {
++			sender.PreAuthorized = true
++		} else {
++			if err := c.session.InteractionRespond(i.Interaction, &discordgo.InteractionResponse{
++				Type: discordgo.InteractionResponseChannelMessageWithSource,
++				Data: &discordgo.InteractionResponseData{
++					Content: "You are not allowed to use this command.",
++					Flags:   discordgo.MessageFlagsEphemeral,
++				},
++			}); err != nil {
++				logger.WarnCF("discord", "Failed to respond to unauthorized interaction", map[string]any{"error": err.Error()})
++			}
++			return
 +		}
-+		return
 +	}
 +
 +	channelID := i.ChannelID
@@ -185,6 +257,46 @@ index 01b1b40..de5ef78 100644
 +	}
 +
 +	c.HandleMessage(c.ctx, peer, "", senderID, channelID, textCommand, nil, metadata, sender)
++}
++
++func (c *DiscordChannel) isAllowedByRole(guildID, userID string, member *discordgo.Member) bool {
++	if guildID == "" {
++		return false
++	}
++
++	allowList := c.config.AllowFrom
++	if len(allowList) == 0 {
++		return false
++	}
++
++	allowSet := make(map[string]struct{}, len(allowList))
++	for _, a := range allowList {
++		allowSet[strings.TrimSpace(a)] = struct{}{}
++	}
++
++	var roles []string
++	if member != nil {
++		roles = member.Roles
++	} else {
++		m, err := c.session.GuildMember(guildID, userID)
++		if err != nil {
++			logger.DebugCF("discord", "Failed to fetch guild member for role check", map[string]any{
++				"guild_id": guildID,
++				"user_id":  userID,
++				"error":    err.Error(),
++			})
++			return false
++		}
++		roles = m.Roles
++	}
++
++	for _, roleID := range roles {
++		if _, ok := allowSet[roleID]; ok {
++			return true
++		}
++	}
++
++	return false
 +}
 +
  // startTyping starts a continuous typing indicator loop for the given chatID.
