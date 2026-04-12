@@ -1,31 +1,112 @@
+diff --git a/pkg/agent/loop.go b/pkg/agent/loop.go
+index 11446d2..9058510 100644
+--- a/pkg/agent/loop.go
++++ b/pkg/agent/loop.go
+@@ -437,6 +437,21 @@ func registerSharedTools(
+ 		} else if (spawnEnabled || spawnStatusEnabled) && !cfg.Tools.IsToolEnabled("subagent") {
+ 			logger.WarnCF("agent", "spawn/spawn_status tools require subagent to be enabled", nil)
+ 		}
++
++		if cfg.Tools.IsToolEnabled("opencode_task") && cfg.Tools.OpenCodeTask.ServerURL != "" {
++			password := ""
++			if cfg.Tools.OpenCodeTask.Password != nil {
++				password = cfg.Tools.OpenCodeTask.Password.String()
++			}
++			agent.Tools.Register(tools.NewOpenCodeTaskTool(
++				cfg.Tools.OpenCodeTask.ServerURL,
++				cfg.Tools.OpenCodeTask.Username,
++				password,
++				msgBus,
++			))
++		} else if cfg.Tools.IsToolEnabled("opencode_task") {
++			logger.WarnCF("agent", "opencode_task enabled but server_url is not configured", nil)
++		}
+ 	}
+ }
+ 
+diff --git a/pkg/config/config.go b/pkg/config/config.go
+index fd4466b..dd3fa16 100644
+--- a/pkg/config/config.go
++++ b/pkg/config/config.go
+@@ -700,6 +700,13 @@ type ToolConfig struct {
+ 	Enabled bool `json:"enabled" yaml:"-" env:"ENABLED"`
+ }
+ 
++type OpenCodeTaskConfig struct {
++	Enabled   bool          `json:"enabled"    yaml:"-" env:"ENABLED"`
++	ServerURL string        `json:"server_url" yaml:"-" env:"SERVER_URL"`
++	Username  string        `json:"username"   yaml:"-" env:"USERNAME"`
++	Password  *SecureString `json:"password,omitzero" yaml:"-" env:"PASSWORD"`
++}
++
+ type BraveConfig struct {
+ 	Enabled    bool          `json:"enabled"           yaml:"-"                  env:"PICOCLAW_TOOLS_WEB_BRAVE_ENABLED"`
+ 	APIKeys    SecureStrings `json:"api_keys,omitzero" yaml:"api_keys,omitempty" env:"PICOCLAW_TOOLS_WEB_BRAVE_API_KEYS"`
+@@ -903,6 +910,7 @@ type ToolsConfig struct {
+ 	SpawnStatus     ToolConfig         `json:"spawn_status"      yaml:"-"                                                       envPrefix:"PICOCLAW_TOOLS_SPAWN_STATUS_"`
+ 	SPI             ToolConfig         `json:"spi"               yaml:"-"                                                       envPrefix:"PICOCLAW_TOOLS_SPI_"`
+ 	Subagent        ToolConfig         `json:"subagent"          yaml:"-"                                                       envPrefix:"PICOCLAW_TOOLS_SUBAGENT_"`
++	OpenCodeTask    OpenCodeTaskConfig `json:"opencode_task"     yaml:"-"                                                       envPrefix:"PICOCLAW_TOOLS_OPENCODE_TASK_"`
+ 	WebFetch        ToolConfig         `json:"web_fetch"         yaml:"-"                                                       envPrefix:"PICOCLAW_TOOLS_WEB_FETCH_"`
+ 	WriteFile       ToolConfig         `json:"write_file"        yaml:"-"                                                       envPrefix:"PICOCLAW_TOOLS_WRITE_FILE_"`
+ }
+@@ -1384,6 +1392,8 @@ func (t *ToolsConfig) IsToolEnabled(name string) bool {
+ 		return t.SPI.Enabled
+ 	case "subagent":
+ 		return t.Subagent.Enabled
++	case "opencode_task":
++		return t.OpenCodeTask.Enabled
+ 	case "web_fetch":
+ 		return t.WebFetch.Enabled
+ 	case "send_file":
 diff --git a/pkg/tools/opencode_task.go b/pkg/tools/opencode_task.go
 new file mode 100644
-index 0000000..1eef400
+index 0000000..40ada4b
 --- /dev/null
 +++ b/pkg/tools/opencode_task.go
-@@ -0,0 +1,168 @@
+@@ -0,0 +1,539 @@
 +package tools
 +
 +import (
++	"bufio"
 +	"bytes"
 +	"context"
 +	"encoding/json"
 +	"fmt"
 +	"io"
 +	"net/http"
++	"net/url"
 +	"strings"
 +	"time"
++
++	"github.com/sipeed/picoclaw/pkg/bus"
++	"github.com/sipeed/picoclaw/pkg/logger"
 +)
++
++// Compile-time check: OpenCodeTaskTool implements AsyncExecutor.
++var _ AsyncExecutor = (*OpenCodeTaskTool)(nil)
 +
 +type OpenCodeTaskTool struct {
 +	serverURL string
 +	username  string
 +	password  string
 +	client    *http.Client
++	sseClient *http.Client
++	msgBus    *bus.MessageBus
 +}
 +
-+func NewOpenCodeTaskTool(serverURL, username, password string) *OpenCodeTaskTool {
++func NewOpenCodeTaskTool(serverURL, username, password string, msgBus *bus.MessageBus) *OpenCodeTaskTool {
 +	serverURL = strings.TrimRight(serverURL, "/")
++
++	if (username == "") != (password == "") {
++		logger.WarnCF("opencode", "Partial auth config: both username and password must be set, or neither; proceeding without auth", map[string]any{
++			"has_username": username != "",
++			"has_password": password != "",
++		})
++		username = ""
++		password = ""
++	}
++
 +	return &OpenCodeTaskTool{
 +		serverURL: serverURL,
 +		username:  username,
@@ -33,6 +114,10 @@ index 0000000..1eef400
 +		client: &http.Client{
 +			Timeout: 10 * time.Minute,
 +		},
++		sseClient: &http.Client{
++			Timeout: 0, // no timeout for long-lived SSE connections
++		},
++		msgBus: msgBus,
 +	}
 +}
 +
@@ -61,17 +146,120 @@ index 0000000..1eef400
 +		return ErrorResult("prompt is required")
 +	}
 +
++	channel := ToolChannel(ctx)
++	chatID := ToolChatID(ctx)
++
++	result, err := t.executeTask(ctx, prompt, channel, chatID)
++	if err != nil {
++		return ErrorResult(err.Error())
++	}
++	return result
++}
++
++func (t *OpenCodeTaskTool) ExecuteAsync(
++	ctx context.Context,
++	args map[string]any,
++	cb AsyncCallback,
++) *ToolResult {
++	prompt, _ := args["prompt"].(string)
++	if strings.TrimSpace(prompt) == "" {
++		return ErrorResult("prompt is required")
++	}
++
++	channel := ToolChannel(ctx)
++	chatID := ToolChatID(ctx)
++
++	go func() {
++		// Detach from turn-scoped ctx so the task survives turn completion.
++		taskCtx, taskCancel := context.WithTimeout(context.Background(), 11*time.Minute)
++		defer taskCancel()
++
++		result, err := t.executeTask(taskCtx, prompt, channel, chatID)
++		if err != nil {
++			result = ErrorResult(err.Error())
++		}
++		if cb != nil {
++			cb(context.Background(), result)
++		}
++	}()
++
++	return AsyncResult(fmt.Sprintf("opencode task started: %.100s...", prompt))
++}
++
++func (t *OpenCodeTaskTool) executeTask(ctx context.Context, prompt, channel, chatID string) (*ToolResult, error) {
 +	sessionID, err := t.createSession(ctx)
 +	if err != nil {
-+		return ErrorResult(fmt.Sprintf("failed to create opencode session: %v", err))
++		return nil, fmt.Errorf("failed to create opencode session: %w", err)
 +	}
 +
-+	response, err := t.sendMessage(ctx, sessionID, prompt)
++	logger.InfoCF("opencode", "Session created", map[string]any{
++		"session_id": sessionID,
++	})
++
++	sseCtx, sseCancel := context.WithCancel(ctx)
++	defer sseCancel()
++
++	sseReady := make(chan error, 1)
++	// sseErr propagates post-connection fatal errors (EOF, reject failure)
++	// so executeTask can abort sendMessage immediately.
++	sseErr := make(chan error, 1)
++	sseDone := make(chan struct{})
++	go func() {
++		defer close(sseDone)
++		t.listenSSE(sseCtx, sessionID, channel, chatID, sseReady, sseErr)
++	}()
++
++	select {
++	case err := <-sseReady:
++		if err != nil {
++			return nil, fmt.Errorf("SSE connection required for question handling but failed: %w", err)
++		}
++	case <-ctx.Done():
++		return nil, ctx.Err()
++	case <-time.After(10 * time.Second):
++		return nil, fmt.Errorf("SSE connection timeout: event monitoring is required to handle agent questions")
++	}
++
++	// msgCtx is a child of the task context so sendMessage can be canceled
++	// independently when SSE fails, avoiding orphaned HTTP requests.
++	msgCtx, msgCancel := context.WithCancel(ctx)
++	defer msgCancel()
++
++	type msgResult struct {
++		response string
++		err      error
++	}
++	msgCh := make(chan msgResult, 1)
++	go func() {
++		resp, err := t.sendMessage(msgCtx, sessionID, prompt)
++		msgCh <- msgResult{resp, err}
++	}()
++
++	var response string
++	select {
++	case mr := <-msgCh:
++		response, err = mr.response, mr.err
++	case sseError := <-sseErr:
++		msgCancel()
++		sseCancel()
++		err = fmt.Errorf("SSE listener failed during task execution: %w", sseError)
++	}
++
++	sseCancel()
++	select {
++	case <-sseDone:
++	case <-time.After(3 * time.Second):
++	}
++
 +	if err != nil {
-+		return ErrorResult(fmt.Sprintf("opencode task failed: %v", err))
++		return nil, fmt.Errorf("opencode task failed: %w", err)
 +	}
 +
-+	return NewToolResult(fmt.Sprintf("opencode agent response (session %s):\n\n%s", sessionID, response))
++	result := &ToolResult{
++		ForLLM:  fmt.Sprintf("opencode agent response (session %s):\n\n%s", sessionID, response),
++		ForUser: fmt.Sprintf("✅ opencode task completed (session %s)", sessionID),
++	}
++	return result, nil
 +}
 +
 +func (t *OpenCodeTaskTool) createSession(ctx context.Context) (string, error) {
@@ -121,7 +309,7 @@ index 0000000..1eef400
 +		return "", fmt.Errorf("marshal request: %w", err)
 +	}
 +
-+	url := fmt.Sprintf("%s/session/%s/message", t.serverURL, sessionID)
++	url := fmt.Sprintf("%s/session/%s/message", t.serverURL, url.PathEscape(sessionID))
 +	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(body))
 +	if err != nil {
 +		return "", fmt.Errorf("create request: %w", err)
@@ -142,7 +330,8 @@ index 0000000..1eef400
 +
 +	var message struct {
 +		Info struct {
-+			Role string `json:"role"`
++			Role  string `json:"role"`
++			Error string `json:"error,omitempty"`
 +		} `json:"info"`
 +		Parts []struct {
 +			Type string `json:"type"`
@@ -151,6 +340,10 @@ index 0000000..1eef400
 +	}
 +	if err := json.NewDecoder(resp.Body).Decode(&message); err != nil {
 +		return "", fmt.Errorf("decode response: %w", err)
++	}
++
++	if message.Info.Error != "" {
++		return "", fmt.Errorf("opencode agent error: %s", message.Info.Error)
 +	}
 +
 +	var parts []string
@@ -167,68 +360,247 @@ index 0000000..1eef400
 +	return strings.Join(parts, "\n\n"), nil
 +}
 +
++type sseEvent struct {
++	Directory string `json:"directory,omitempty"`
++	Payload   struct {
++		Type       string          `json:"type"`
++		Properties json.RawMessage `json:"properties"`
++	} `json:"payload"`
++}
++
++type questionProperties struct {
++	ID        string `json:"id"`
++	SessionID string `json:"sessionID"`
++	Questions []struct {
++		Question string `json:"question"`
++		Header   string `json:"header"`
++		Options  []struct {
++			Label       string `json:"label"`
++			Description string `json:"description"`
++		} `json:"options"`
++		Multiple bool `json:"multiple,omitempty"`
++		Custom   bool `json:"custom,omitempty"`
++	} `json:"questions"`
++}
++
++func (t *OpenCodeTaskTool) listenSSE(ctx context.Context, sessionID, channel, chatID string, ready chan<- error, sseErr chan<- error) {
++	req, err := http.NewRequestWithContext(ctx, http.MethodGet, t.serverURL+"/event", nil)
++	if err != nil {
++		ready <- fmt.Errorf("create SSE request: %w", err)
++		return
++	}
++	req.Header.Set("Accept", "text/event-stream")
++	req.Header.Set("Cache-Control", "no-cache")
++	t.setAuth(req)
++
++	resp, err := t.sseClient.Do(req)
++	if err != nil {
++		ready <- fmt.Errorf("SSE connect: %w", err)
++		return
++	}
++	defer resp.Body.Close()
++
++	if resp.StatusCode != http.StatusOK {
++		ready <- fmt.Errorf("SSE status %d", resp.StatusCode)
++		return
++	}
++
++	ct := resp.Header.Get("Content-Type")
++	if !strings.HasPrefix(ct, "text/event-stream") {
++		ready <- fmt.Errorf("unexpected SSE Content-Type: %s", ct)
++		return
++	}
++
++	logger.InfoCF("opencode", "SSE listener connected", map[string]any{
++		"session_id": sessionID,
++	})
++	ready <- nil
++
++	scanner := bufio.NewScanner(resp.Body)
++	// SSE events can be large (e.g. message.part.delta with full code blocks).
++	scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
++
++	var dataLines []string
++	for scanner.Scan() {
++		if ctx.Err() != nil {
++			return
++		}
++
++		line := scanner.Text()
++
++		// SSE spec: "data:" may or may not be followed by a space.
++		if strings.HasPrefix(line, "data:") {
++			value := strings.TrimPrefix(line, "data:")
++			value = strings.TrimPrefix(value, " ")
++			dataLines = append(dataLines, value)
++			continue
++		}
++
++		// SSE spec: empty line terminates an event.
++		if line == "" && len(dataLines) > 0 {
++			data := strings.Join(dataLines, "\n")
++			dataLines = nil
++			t.handleSSEEvent(ctx, data, sessionID, channel, chatID, sseErr)
++		}
++	}
++
++	if err := scanner.Err(); err != nil && ctx.Err() == nil {
++		logger.WarnCF("opencode", "SSE scanner error", map[string]any{"error": err.Error()})
++		select {
++		case sseErr <- fmt.Errorf("SSE scanner error: %w", err):
++		default:
++		}
++	} else if ctx.Err() == nil {
++		logger.WarnCF("opencode", "SSE connection closed by server unexpectedly", map[string]any{
++			"session_id": sessionID,
++		})
++		select {
++		case sseErr <- fmt.Errorf("SSE connection closed by server (EOF)"):
++		default:
++		}
++	}
++}
++
++func (t *OpenCodeTaskTool) handleSSEEvent(ctx context.Context, data, sessionID, channel, chatID string, sseErr chan<- error) {
++	var event sseEvent
++	if err := json.Unmarshal([]byte(data), &event); err != nil {
++		logger.DebugCF("opencode", "Failed to parse SSE event", map[string]any{"error": err.Error()})
++		return
++	}
++
++	switch event.Payload.Type {
++	case "question.asked":
++		t.handleQuestionAsked(event.Payload.Properties, sessionID, channel, chatID, sseErr)
++	case "session.updated", "message.updated":
++		logger.DebugCF("opencode", "SSE event received", map[string]any{
++			"type": event.Payload.Type,
++		})
++	}
++}
++
++func (t *OpenCodeTaskTool) handleQuestionAsked(raw json.RawMessage, sessionID, channel, chatID string, sseErr chan<- error) {
++	var qp questionProperties
++	if err := json.Unmarshal(raw, &qp); err != nil {
++		logger.WarnCF("opencode", "Failed to parse question properties", map[string]any{"error": err.Error()})
++		return
++	}
++
++	if qp.SessionID != sessionID {
++		return
++	}
++
++	if qp.ID == "" {
++		logger.WarnCF("opencode", "Received question.asked with empty ID; cannot reject, failing task", map[string]any{
++			"session_id": sessionID,
++		})
++		select {
++		case sseErr <- fmt.Errorf("question.asked for session %s has empty ID; cannot reject", sessionID):
++		default:
++		}
++		return
++	}
++
++	logger.InfoCF("opencode", "Question asked by opencode agent, will auto-reject", map[string]any{
++		"question_id": qp.ID,
++		"session_id":  sessionID,
++	})
++
++	msg := t.formatQuestion(&qp)
++
++	if t.msgBus != nil && channel != "" && chatID != "" {
++		pubCtx, pubCancel := context.WithTimeout(context.Background(), 5*time.Second)
++		defer pubCancel()
++		if err := t.msgBus.PublishOutbound(pubCtx, bus.OutboundMessage{
++			Channel: channel,
++			ChatID:  chatID,
++			Content: msg,
++		}); err != nil {
++			logger.WarnCF("opencode", "Failed to forward question to channel", map[string]any{
++				"error":       err.Error(),
++				"question_id": qp.ID,
++			})
++		}
++	}
++
++	if err := t.rejectQuestion(qp.ID); err != nil {
++		logger.WarnCF("opencode", "Failed to reject question; agent may hang waiting for reply", map[string]any{
++			"error":       err.Error(),
++			"question_id": qp.ID,
++			"session_id":  sessionID,
++		})
++		select {
++		case sseErr <- fmt.Errorf("failed to reject question %s: %w", qp.ID, err):
++		default:
++		}
++	}
++}
++
++func (t *OpenCodeTaskTool) formatQuestion(qp *questionProperties) string {
++	var sb strings.Builder
++	sb.WriteString("🤖 **opencode agent is asking:**\n\n")
++
++	for i, q := range qp.Questions {
++		if len(qp.Questions) > 1 {
++			sb.WriteString(fmt.Sprintf("**Q%d** ", i+1))
++		}
++		if q.Header != "" {
++			sb.WriteString(fmt.Sprintf("**[%s]** ", sanitizeDiscordMentions(q.Header)))
++		}
++		sb.WriteString(sanitizeDiscordMentions(q.Question))
++		sb.WriteString("\n")
++
++		for j, opt := range q.Options {
++			sb.WriteString(fmt.Sprintf("  %d. **%s**", j+1, sanitizeDiscordMentions(opt.Label)))
++			if opt.Description != "" {
++				sb.WriteString(fmt.Sprintf(" — %s", sanitizeDiscordMentions(opt.Description)))
++			}
++			sb.WriteString("\n")
++		}
++		sb.WriteString("\n")
++	}
++
++	sb.WriteString("_(auto-rejected: interactive reply not yet supported)_")
++	return sb.String()
++}
++
++// sanitizeDiscordMentions escapes Discord mention patterns to prevent mention injection.
++func sanitizeDiscordMentions(s string) string {
++	s = strings.ReplaceAll(s, "@everyone", "@\u200beveryone")
++	s = strings.ReplaceAll(s, "@here", "@\u200bhere")
++	s = strings.ReplaceAll(s, "<@", "<\u200b@")
++	return s
++}
++
++func (t *OpenCodeTaskTool) rejectQuestion(questionID string) error {
++	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
++	defer cancel()
++
++	rejectURL := fmt.Sprintf("%s/control/question/%s/reject", t.serverURL, url.PathEscape(questionID))
++	req, err := http.NewRequestWithContext(ctx, http.MethodPost, rejectURL, nil)
++	if err != nil {
++		return fmt.Errorf("create question reject request: %w", err)
++	}
++	t.setAuth(req)
++
++	resp, err := t.client.Do(req)
++	if err != nil {
++		return fmt.Errorf("reject question: %w", err)
++	}
++	defer resp.Body.Close()
++
++	if resp.StatusCode != http.StatusOK {
++		respBody, _ := io.ReadAll(resp.Body)
++		return fmt.Errorf("question reject returned %d: %s", resp.StatusCode, string(respBody))
++	}
++
++	logger.InfoCF("opencode", "Question auto-rejected", map[string]any{
++		"question_id": questionID,
++	})
++	return nil
++}
++
 +func (t *OpenCodeTaskTool) setAuth(req *http.Request) {
-+	if t.username != "" || t.password != "" {
++	if t.username != "" && t.password != "" {
 +		req.SetBasicAuth(t.username, t.password)
 +	}
 +}
-diff --git a/pkg/agent/loop.go b/pkg/agent/loop.go
-index 11446d2..c665578 100644
---- a/pkg/agent/loop.go
-+++ b/pkg/agent/loop.go
-@@ -437,6 +437,20 @@ func registerSharedTools(
- 		} else if (spawnEnabled || spawnStatusEnabled) && !cfg.Tools.IsToolEnabled("subagent") {
- 			logger.WarnCF("agent", "spawn/spawn_status tools require subagent to be enabled", nil)
- 		}
-+
-+		if cfg.Tools.IsToolEnabled("opencode_task") && cfg.Tools.OpenCodeTask.ServerURL != "" {
-+			password := ""
-+			if cfg.Tools.OpenCodeTask.Password != nil {
-+				password = cfg.Tools.OpenCodeTask.Password.String()
-+			}
-+			agent.Tools.Register(tools.NewOpenCodeTaskTool(
-+				cfg.Tools.OpenCodeTask.ServerURL,
-+				cfg.Tools.OpenCodeTask.Username,
-+				password,
-+			))
-+		} else if cfg.Tools.IsToolEnabled("opencode_task") {
-+			logger.WarnCF("agent", "opencode_task enabled but server_url is not configured", nil)
-+		}
- 	}
- }
- 
-diff --git a/pkg/config/config.go b/pkg/config/config.go
-index fd4466b..dd3fa16 100644
---- a/pkg/config/config.go
-+++ b/pkg/config/config.go
-@@ -700,6 +700,13 @@ type ToolConfig struct {
- 	Enabled bool `json:"enabled" yaml:"-" env:"ENABLED"`
- }
- 
-+type OpenCodeTaskConfig struct {
-+	Enabled   bool          `json:"enabled"    yaml:"-" env:"ENABLED"`
-+	ServerURL string        `json:"server_url" yaml:"-" env:"SERVER_URL"`
-+	Username  string        `json:"username"   yaml:"-" env:"USERNAME"`
-+	Password  *SecureString `json:"password,omitzero" yaml:"-" env:"PASSWORD"`
-+}
-+
- type BraveConfig struct {
- 	Enabled    bool          `json:"enabled"           yaml:"-"                  env:"PICOCLAW_TOOLS_WEB_BRAVE_ENABLED"`
- 	APIKeys    SecureStrings `json:"api_keys,omitzero" yaml:"api_keys,omitempty" env:"PICOCLAW_TOOLS_WEB_BRAVE_API_KEYS"`
-@@ -903,6 +910,7 @@ type ToolsConfig struct {
- 	SpawnStatus     ToolConfig         `json:"spawn_status"      yaml:"-"                                                       envPrefix:"PICOCLAW_TOOLS_SPAWN_STATUS_"`
- 	SPI             ToolConfig         `json:"spi"               yaml:"-"                                                       envPrefix:"PICOCLAW_TOOLS_SPI_"`
- 	Subagent        ToolConfig         `json:"subagent"          yaml:"-"                                                       envPrefix:"PICOCLAW_TOOLS_SUBAGENT_"`
-+	OpenCodeTask    OpenCodeTaskConfig `json:"opencode_task"     yaml:"-"                                                       envPrefix:"PICOCLAW_TOOLS_OPENCODE_TASK_"`
- 	WebFetch        ToolConfig         `json:"web_fetch"         yaml:"-"                                                       envPrefix:"PICOCLAW_TOOLS_WEB_FETCH_"`
- 	WriteFile       ToolConfig         `json:"write_file"        yaml:"-"                                                       envPrefix:"PICOCLAW_TOOLS_WRITE_FILE_"`
- }
-@@ -1384,6 +1392,8 @@ func (t *ToolsConfig) IsToolEnabled(name string) bool {
- 		return t.SPI.Enabled
- 	case "subagent":
- 		return t.Subagent.Enabled
-+	case "opencode_task":
-+		return t.OpenCodeTask.Enabled
- 	case "web_fetch":
- 		return t.WebFetch.Enabled
- 	case "send_file":
