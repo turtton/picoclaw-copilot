@@ -1,38 +1,46 @@
+[日本語](README.ja.md)
+
 # picoclaw-copilot
 
-[picoclaw](https://github.com/sipeed/picoclaw) の soft-fork ディストリビューション。パッチベースでカスタマイズを行い、Nix flake でビルドし、GitHub Actions で GHCR に自動公開します。
+A soft fork of [picoclaw](https://github.com/sipeed/picoclaw). This project focuses on patch-based customization, Nix flake builds, and auto-publishing to GHCR via GitHub Actions.
 
-## カスタマイズ内容
+## Customizations
 
-- 全ビルトインコマンド（start, help, show, list, use, switch, check, clear, subagents, reload）を Discord スラッシュコマンドとして登録（テキストコマンドも引き続き動作）
-- `allow_from` で Discord ロール ID をサポート（ユーザー ID と併用可能）
-  - ロール ID によるアクセス制御はギルド（サーバー）内のメッセージ・スラッシュコマンドでのみ有効です。DM ではロール情報を取得できないため、DM でも利用させたい場合はユーザー ID も併記してください。
+- Register all built-in commands (start, help, show, list, use, switch, check, clear, subagents, reload) as Discord slash commands. Text commands still work as usual.
+- Support Discord role IDs in `allow_from` configuration, alongside user IDs.
+  - Role-based access control works only for messages and slash commands within a guild (server). DM interactions don't provide role information, so include user IDs if you need DM access.
 
-## 含まれるパッケージ
+## Patches
 
-| パッケージ | 用途 |
+| Filename | Summary | Features Added |
+|---|---|---|
+| `0001-add-slash-commands.patch` | Modifies `pkg/bus/types.go`, `pkg/channels/base.go`, and `pkg/channels/discord/discord.go` | Adds Discord slash command registration for 10 built-in commands, implements `handleInteraction` to translate slash commands to text format, adds `isAllowedByRole` helper for role-based `allow_from` support, and introduces a `PreAuthorized` flag to skip redundant allow-list re-checks. |
+
+## Included Packages
+
+| Package | Purpose |
 |---|---|
-| picoclaw | 本体 |
-| git | リポジトリ操作 |
-| openssh | SSH 接続 |
-| gh (GitHub CLI) | GitHub API 操作 |
-| bash | シェル |
-| coreutils | 基本コマンド |
-| cacert | TLS 証明書 |
-| tzdata | タイムゾーン |
+| picoclaw | Core application |
+| git | Repository operations |
+| openssh | SSH connectivity |
+| gh (GitHub CLI) | GitHub API interactions |
+| bash | Shell environment |
+| coreutils | Essential commands |
+| cacert | TLS certificates |
+| tzdata | Timezone data |
 
-## 使い方
+## Usage
 
 ```bash
 docker pull ghcr.io/turtton/picoclaw-copilot:latest
 docker run --rm ghcr.io/turtton/picoclaw-copilot version
 ```
 
-`ENTRYPOINT` が `picoclaw` に設定されているため、引数はそのまま picoclaw のサブコマンド/フラグとして渡されます。
+The `ENTRYPOINT` is set to `picoclaw`, so any arguments pass directly to picoclaw subcommands and flags.
 
-## ローカルビルド
+## Local Build
 
-[Nix](https://nixos.org/) が必要です。
+Requires [Nix](https://nixos.org/).
 
 ```bash
 nix build .#picoclaw
@@ -40,17 +48,17 @@ nix build .#docker
 docker load < result
 ```
 
-## パッチ開発
+## Patch Development
 
 ```bash
 ./scripts/fetch-upstream.sh
 ./scripts/apply-patches.sh
 
-# .upstream/ 内で変更を加えた後:
+# After making changes in .upstream/:
 ./scripts/create-patch.sh 0002-my-change
 ```
 
 ## CI/CD
 
-- **Build and Push** (`build.yml`): `main` への push 時に Docker イメージをビルドし GHCR に公開
-- **Update** (`update.yml`): 毎日 upstream の新バージョンをチェックし、自動で `flake.nix` と `.upstream-version` を更新・コミット。パッチが新バージョンに適用できない場合はビルドが失敗します
+- **Build and Push** (`build.yml`): Builds the Docker image and pushes it to GHCR on every push to `main`.
+- **Update** (`update.yml`): Checks for new upstream versions daily and automatically updates/commits `flake.nix` and `.upstream-version`. If patches fail to apply to the new version, the build will fail.
