@@ -9,12 +9,14 @@ A soft fork of [picoclaw](https://github.com/sipeed/picoclaw). This project focu
 - Register all built-in commands (start, help, show, list, use, switch, check, clear, subagents, reload) as Discord slash commands. Text commands still work as usual.
 - Support Discord role IDs in `allow_from` configuration, alongside user IDs.
   - Role-based access control works only for messages and slash commands within a guild (server). DM interactions don't provide role information, so include user IDs if you need DM access.
+- `opencode_task` tool: Delegate coding tasks to an [opencode](https://opencode.ai/) agent via its REST API. Supports HTTP Basic authentication.
 
 ## Patches
 
 | Filename | Summary | Features Added |
 |---|---|---|
 | `0001-add-slash-commands.patch` | Modifies `pkg/bus/types.go`, `pkg/channels/base.go`, and `pkg/channels/discord/discord.go` | Adds Discord slash command registration for 10 built-in commands, implements `handleInteraction` to translate slash commands to text format, adds `isAllowedByRole` helper for role-based `allow_from` support, and introduces a `PreAuthorized` flag to skip redundant allow-list re-checks. |
+| `0002-add-opencode-tool.patch` | Adds `pkg/tools/opencode_task.go`, modifies `pkg/config/config.go` and `pkg/agent/loop.go` | Adds `opencode_task` tool that delegates coding tasks to an opencode agent via REST API (POST /session → POST /session/:id/message). Configurable via `PICOCLAW_TOOLS_OPENCODE_TASK_*` env vars (ENABLED, SERVER_URL, USERNAME, PASSWORD). |
 
 ## Included Packages
 

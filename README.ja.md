@@ -9,12 +9,14 @@
 - 全ビルトインコマンド（start, help, show, list, use, switch, check, clear, subagents, reload）を Discord スラッシュコマンドとして登録（テキストコマンドも引き続き動作）
 - `allow_from` で Discord ロール ID をサポート（ユーザー ID と併用可能）
   - ロール ID によるアクセス制御はギルド（サーバー）内のメッセージ・スラッシュコマンドでのみ有効です。DM ではロール情報を取得できないため、DM でも利用させたい場合はユーザー ID も併記してください。
+- `opencode_task` ツール: [opencode](https://opencode.ai/) エージェントに REST API 経由でコーディングタスクを委譲。HTTP Basic 認証に対応。
 
 ## パッチ一覧
 
 | ファイル名 | 概要 | 追加機能 |
 |---|---|---|
 | `0001-add-slash-commands.patch` | `pkg/bus/types.go`, `pkg/channels/base.go`, `pkg/channels/discord/discord.go` を修正 | 全10種のビルトインコマンドを Discord スラッシュコマンドとして登録。スラッシュコマンドをテキスト形式に変換して処理する `handleInteraction`、ロールベースの `allow_from` 対応、および許可チェックの重複をスキップする `PreAuthorized` フラグを追加。 |
+| `0002-add-opencode-tool.patch` | `pkg/tools/opencode_task.go` を新規追加、`pkg/config/config.go` と `pkg/agent/loop.go` を修正 | opencode エージェントに REST API 経由でタスクを委譲する `opencode_task` ツールを追加（POST /session → POST /session/:id/message）。`PICOCLAW_TOOLS_OPENCODE_TASK_*` 環境変数（ENABLED, SERVER_URL, USERNAME, PASSWORD）で設定。 |
 
 ## 含まれるパッケージ
 
