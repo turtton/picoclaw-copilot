@@ -10,6 +10,7 @@ A soft fork of [picoclaw](https://github.com/sipeed/picoclaw). This project focu
 - Support Discord role IDs in `allow_from` configuration, alongside user IDs.
   - Role-based access control works only for messages and slash commands within a guild (server). DM interactions don't provide role information, so include user IDs if you need DM access.
 - `opencode_task` tool: Delegate coding tasks to an [opencode](https://opencode.ai/) agent via its REST API. Supports async execution, SSE event monitoring (forwards `question.asked` events to Discord with auto-reject), and HTTP Basic authentication.
+  - **Requires a separately running opencode server.** This tool connects to it via `SERVER_URL` — opencode is not included in this image.
   - **Note**: This tool targets a self-hosted opencode server's internal API. The SSE event format and question/control endpoints may differ from the public opencode SDK. Verify your server version matches the expected API contract.
 
 ## Patches

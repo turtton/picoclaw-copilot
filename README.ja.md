@@ -10,6 +10,7 @@
 - `allow_from` で Discord ロール ID をサポート（ユーザー ID と併用可能）
   - ロール ID によるアクセス制御はギルド（サーバー）内のメッセージ・スラッシュコマンドでのみ有効です。DM ではロール情報を取得できないため、DM でも利用させたい場合はユーザー ID も併記してください。
 - `opencode_task` ツール: [opencode](https://opencode.ai/) エージェントに REST API 経由でコーディングタスクを委譲。非同期実行、SSE イベント監視（`question.asked` イベントの Discord 転送 + 自動 reject）、HTTP Basic 認証に対応。
+  - **別途 opencode サーバーの起動が必要です。** このツールは `SERVER_URL` で指定されたサーバーに接続します。opencode 本体はこのイメージに含まれていません。
   - **注意**: このツールはセルフホスト版 opencode サーバーの内部 API を対象としています。SSE イベント形式や question/control エンドポイントは公開 opencode SDK と異なる場合があります。サーバーバージョンが想定する API 仕様と一致することを確認してください。
 
 ## パッチ一覧
