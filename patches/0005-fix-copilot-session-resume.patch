@@ -1,0 +1,88 @@
+diff --git a/pkg/providers/github_copilot_provider.go b/pkg/providers/github_copilot_provider.go
+index 472c142..ab24e6f 100644
+--- a/pkg/providers/github_copilot_provider.go
++++ b/pkg/providers/github_copilot_provider.go
+@@ -4,6 +4,7 @@ import (
+ 	"context"
+ 	"encoding/json"
+ 	"fmt"
++	"strings"
+ 	"sync"
+ 
+ 	copilot "github.com/github/copilot-sdk/go"
+@@ -12,6 +13,7 @@ import (
+ type GitHubCopilotProvider struct {
+ 	uri         string
+ 	connectMode string // "stdio" or "grpc"
++	model       string
+ 
+ 	client  *copilot.Client
+ 	session *copilot.Session
+@@ -53,6 +55,7 @@ func NewGitHubCopilotProvider(uri string, connectMode string, model string) (*Gi
+ 		return &GitHubCopilotProvider{
+ 			uri:         uri,
+ 			connectMode: connectMode,
++			model:       model,
+ 			client:      client,
+ 			session:     session,
+ 		}, nil
+@@ -71,6 +74,39 @@ func (p *GitHubCopilotProvider) Close() {
+ 	}
+ }
+ 
++// isSessionNotFoundError reports whether err indicates the Copilot CLI has
++// discarded our cached session (typically due to idle timeout or CLI restart).
++// When this happens we can transparently recreate the session and retry.
++func isSessionNotFoundError(err error) bool {
++	if err == nil {
++		return false
++	}
++	return strings.Contains(err.Error(), "Session not found")
++}
++
++// recreateSession replaces p.session with a freshly created one. Caller must
++// not hold p.mu. Returns the new session on success.
++func (p *GitHubCopilotProvider) recreateSession(ctx context.Context) (*copilot.Session, error) {
++	p.mu.Lock()
++	defer p.mu.Unlock()
++
++	if p.client == nil {
++		return nil, fmt.Errorf("provider closed")
++	}
++
++	session, err := p.client.CreateSession(ctx, &copilot.SessionConfig{
++		Model:               p.model,
++		OnPermissionRequest: copilot.PermissionHandler.ApproveAll,
++		Hooks:               &copilot.SessionHooks{},
++	})
++	if err != nil {
++		return nil, fmt.Errorf("recreate session failed: %w", err)
++	}
++
++	p.session = session
++	return session, nil
++}
++
+ func (p *GitHubCopilotProvider) Chat(
+ 	ctx context.Context,
+ 	messages []Message,
+@@ -105,6 +141,19 @@ func (p *GitHubCopilotProvider) Chat(
+ 	resp, err := session.SendAndWait(ctx, copilot.MessageOptions{
+ 		Prompt: string(fullcontent),
+ 	})
++	// If the Copilot CLI has discarded our session (idle timeout or CLI
++	// restart), transparently recreate it and retry once. Without this, the
++	// provider would keep failing with the same stale session ID until the
++	// whole pod is restarted.
++	if err != nil && isSessionNotFoundError(err) {
++		newSession, recreateErr := p.recreateSession(ctx)
++		if recreateErr != nil {
++			return nil, fmt.Errorf("failed to send message to copilot: %w (and failed to recreate session: %v)", err, recreateErr)
++		}
++		resp, err = newSession.SendAndWait(ctx, copilot.MessageOptions{
++			Prompt: string(fullcontent),
++		})
++	}
+ 	if err != nil {
+ 		return nil, fmt.Errorf("failed to send message to copilot: %w", err)
+ 	}
