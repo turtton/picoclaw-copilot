@@ -35,6 +35,9 @@
 
             patches = [
               ./patches/0001-add-slash-commands.patch
+              ./patches/0002-add-opencode-tool.patch
+              ./patches/0003-add-multi-channel-session-history.patch
+              ./patches/0004-add-subagent-discord-visibility.patch
               ./patches/0005-fix-copilot-session-resume.patch
             ];
 
