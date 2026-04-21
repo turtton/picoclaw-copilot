@@ -64,7 +64,7 @@ new file mode 100644
 index 0000000..40ada4b
 --- /dev/null
 +++ b/pkg/tools/opencode_task.go
-@@ -0,0 +1,539 @@
+@@ -0,0 +1,647 @@
 +package tools
 +
 +import (
@@ -200,13 +200,14 @@ index 0000000..40ada4b
 +	defer sseCancel()
 +
 +	sseReady := make(chan error, 1)
++	completionCh := make(chan string, 1)
 +	// sseErr propagates post-connection fatal errors (EOF, reject failure)
 +	// so executeTask can abort sendMessage immediately.
 +	sseErr := make(chan error, 1)
 +	sseDone := make(chan struct{})
 +	go func() {
 +		defer close(sseDone)
-+		t.listenSSE(sseCtx, sessionID, channel, chatID, sseReady, sseErr)
++		t.listenSSE(sseCtx, sessionID, channel, chatID, sseReady, sseErr, completionCh)
 +	}()
 +
 +	select {
@@ -225,25 +226,64 @@ index 0000000..40ada4b
 +	msgCtx, msgCancel := context.WithCancel(ctx)
 +	defer msgCancel()
 +
-+	type msgResult struct {
-+		response string
-+		err      error
-+	}
-+	msgCh := make(chan msgResult, 1)
++	msgCh := make(chan error, 1)
 +	go func() {
-+		resp, err := t.sendMessage(msgCtx, sessionID, prompt)
-+		msgCh <- msgResult{resp, err}
++		msgCh <- t.sendMessage(msgCtx, sessionID, prompt)
 +	}()
 +
-+	var response string
 +	select {
-+	case mr := <-msgCh:
-+		response, err = mr.response, mr.err
++	case err = <-msgCh:
 +	case sseError := <-sseErr:
-+		msgCancel()
-+		sseCancel()
-+		err = fmt.Errorf("SSE listener failed during task execution: %w", sseError)
++		select {
++		case <-completionCh:
++			err = nil
++		default:
++			msgCancel()
++			sseCancel()
++			err = fmt.Errorf("SSE listener failed during task execution: %w", sseError)
++		}
 +	}
++
++	if err != nil {
++		sseCancel()
++		select {
++		case <-sseDone:
++		case <-time.After(3 * time.Second):
++		}
++		return nil, fmt.Errorf("opencode task failed: %w", err)
++	}
++
++	var completedSessionID string
++	select {
++	case completedSessionID = <-completionCh:
++	case sseError := <-sseErr:
++		select {
++		case completedSessionID = <-completionCh:
++		default:
++			sseCancel()
++			select {
++			case <-sseDone:
++			case <-time.After(3 * time.Second):
++			}
++			return nil, fmt.Errorf("opencode task failed: SSE listener failed during task execution: %w", sseError)
++		}
++	case <-ctx.Done():
++		sseCancel()
++		select {
++		case <-sseDone:
++		case <-time.After(3 * time.Second):
++		}
++		return nil, fmt.Errorf("opencode task failed: %w", ctx.Err())
++	case <-time.After(10 * time.Minute):
++		sseCancel()
++		select {
++		case <-sseDone:
++		case <-time.After(3 * time.Second):
++		}
++		return nil, fmt.Errorf("opencode task failed: timed out waiting for assistant completion event")
++	}
++
++	response, err := t.getMessages(ctx, completedSessionID)
 +
 +	sseCancel()
 +	select {
@@ -299,22 +339,44 @@ index 0000000..40ada4b
 +	return result.ID, nil
 +}
 +
-+func (t *OpenCodeTaskTool) sendMessage(ctx context.Context, sessionID, prompt string) (string, error) {
++func (t *OpenCodeTaskTool) sendMessage(ctx context.Context, sessionID, prompt string) error {
 +	body, err := json.Marshal(map[string]any{
 +		"parts": []map[string]any{
 +			{"type": "text", "text": prompt},
 +		},
 +	})
 +	if err != nil {
-+		return "", fmt.Errorf("marshal request: %w", err)
++		return fmt.Errorf("marshal request: %w", err)
 +	}
 +
 +	url := fmt.Sprintf("%s/session/%s/message", t.serverURL, url.PathEscape(sessionID))
 +	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(body))
 +	if err != nil {
-+		return "", fmt.Errorf("create request: %w", err)
++		return fmt.Errorf("create request: %w", err)
 +	}
 +	req.Header.Set("Content-Type", "application/json")
++	t.setAuth(req)
++
++	resp, err := t.client.Do(req)
++	if err != nil {
++		return fmt.Errorf("http request: %w", err)
++	}
++	defer resp.Body.Close()
++
++	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusCreated && resp.StatusCode != http.StatusAccepted {
++		respBody, _ := io.ReadAll(resp.Body)
++		return fmt.Errorf("unexpected status %d: %s", resp.StatusCode, string(respBody))
++	}
++
++	return nil
++}
++
++func (t *OpenCodeTaskTool) getMessages(ctx context.Context, sessionID string) (string, error) {
++	url := fmt.Sprintf("%s/session/%s/message", t.serverURL, url.PathEscape(sessionID))
++	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
++	if err != nil {
++		return "", fmt.Errorf("create request: %w", err)
++	}
 +	t.setAuth(req)
 +
 +	resp, err := t.client.Do(req)
@@ -328,36 +390,39 @@ index 0000000..40ada4b
 +		return "", fmt.Errorf("unexpected status %d: %s", resp.StatusCode, string(respBody))
 +	}
 +
-+	var message struct {
++	var messages []struct {
 +		Info struct {
-+			Role  string `json:"role"`
-+			Error string `json:"error,omitempty"`
++			Role string `json:"role"`
 +		} `json:"info"`
 +		Parts []struct {
 +			Type string `json:"type"`
 +			Text string `json:"text,omitempty"`
 +		} `json:"parts"`
 +	}
-+	if err := json.NewDecoder(resp.Body).Decode(&message); err != nil {
++	if err := json.NewDecoder(resp.Body).Decode(&messages); err != nil {
 +		return "", fmt.Errorf("decode response: %w", err)
 +	}
 +
-+	if message.Info.Error != "" {
-+		return "", fmt.Errorf("opencode agent error: %s", message.Info.Error)
-+	}
-+
-+	var parts []string
-+	for _, p := range message.Parts {
-+		if p.Type == "text" && strings.TrimSpace(p.Text) != "" {
-+			parts = append(parts, p.Text)
++	for i := len(messages) - 1; i >= 0; i-- {
++		if messages[i].Info.Role != "assistant" {
++			continue
 +		}
++
++		var parts []string
++		for _, p := range messages[i].Parts {
++			if p.Type == "text" && strings.TrimSpace(p.Text) != "" {
++				parts = append(parts, p.Text)
++			}
++		}
++
++		if len(parts) == 0 {
++			return "(no text response from opencode agent)", nil
++		}
++
++		return strings.Join(parts, "\n\n"), nil
 +	}
 +
-+	if len(parts) == 0 {
-+		return "(no text response from opencode agent)", nil
-+	}
-+
-+	return strings.Join(parts, "\n\n"), nil
++	return "(no text response from opencode agent)", nil
 +}
 +
 +type sseEvent struct {
@@ -383,7 +448,17 @@ index 0000000..40ada4b
 +	} `json:"questions"`
 +}
 +
-+func (t *OpenCodeTaskTool) listenSSE(ctx context.Context, sessionID, channel, chatID string, ready chan<- error, sseErr chan<- error) {
++type messageUpdatedProperties struct {
++	SessionID string `json:"sessionID"`
++	Info      struct {
++		Role string `json:"role"`
++		Time struct {
++			Completed float64 `json:"completed"`
++		} `json:"time"`
++	} `json:"info"`
++}
++
++func (t *OpenCodeTaskTool) listenSSE(ctx context.Context, sessionID, channel, chatID string, ready chan<- error, sseErr chan<- error, completionCh chan string) {
 +	req, err := http.NewRequestWithContext(ctx, http.MethodGet, t.serverURL+"/event", nil)
 +	if err != nil {
 +		ready <- fmt.Errorf("create SSE request: %w", err)
@@ -421,6 +496,7 @@ index 0000000..40ada4b
 +	scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
 +
 +	var dataLines []string
++	completionSeen := false
 +	for scanner.Scan() {
 +		if ctx.Err() != nil {
 +			return
@@ -440,7 +516,16 @@ index 0000000..40ada4b
 +		if line == "" && len(dataLines) > 0 {
 +			data := strings.Join(dataLines, "\n")
 +			dataLines = nil
-+			t.handleSSEEvent(ctx, data, sessionID, channel, chatID, sseErr)
++			if t.handleSSEEvent(ctx, data, sessionID, channel, chatID, sseErr, completionCh) {
++				completionSeen = true
++			}
++		}
++	}
++
++	if ctx.Err() == nil && len(dataLines) > 0 {
++		data := strings.Join(dataLines, "\n")
++		if t.handleSSEEvent(ctx, data, sessionID, channel, chatID, sseErr, completionCh) {
++			completionSeen = true
 +		}
 +	}
 +
@@ -450,7 +535,7 @@ index 0000000..40ada4b
 +		case sseErr <- fmt.Errorf("SSE scanner error: %w", err):
 +		default:
 +		}
-+	} else if ctx.Err() == nil {
++	} else if ctx.Err() == nil && !completionSeen {
 +		logger.WarnCF("opencode", "SSE connection closed by server unexpectedly", map[string]any{
 +			"session_id": sessionID,
 +		})
@@ -461,21 +546,44 @@ index 0000000..40ada4b
 +	}
 +}
 +
-+func (t *OpenCodeTaskTool) handleSSEEvent(ctx context.Context, data, sessionID, channel, chatID string, sseErr chan<- error) {
++func (t *OpenCodeTaskTool) handleSSEEvent(ctx context.Context, data, sessionID, channel, chatID string, sseErr chan<- error, completionCh chan string) bool {
 +	var event sseEvent
 +	if err := json.Unmarshal([]byte(data), &event); err != nil {
 +		logger.DebugCF("opencode", "Failed to parse SSE event", map[string]any{"error": err.Error()})
-+		return
++		return false
 +	}
 +
 +	switch event.Payload.Type {
 +	case "question.asked":
 +		t.handleQuestionAsked(event.Payload.Properties, sessionID, channel, chatID, sseErr)
-+	case "session.updated", "message.updated":
++	case "message.updated":
++		var props messageUpdatedProperties
++		if err := json.Unmarshal(event.Payload.Properties, &props); err != nil {
++			logger.DebugCF("opencode", "Failed to parse message.updated properties", map[string]any{"error": err.Error()})
++			return false
++		}
++
++		if props.SessionID == sessionID && props.Info.Role == "assistant" && props.Info.Time.Completed > 0 {
++			logger.InfoCF("opencode", "Assistant completion detected", map[string]any{
++				"session_id": sessionID,
++			})
++			select {
++			case completionCh <- props.SessionID:
++			default:
++			}
++			return true
++		}
++
++		logger.DebugCF("opencode", "SSE event received", map[string]any{
++			"type": event.Payload.Type,
++		})
++	case "session.updated":
 +		logger.DebugCF("opencode", "SSE event received", map[string]any{
 +			"type": event.Payload.Type,
 +		})
 +	}
++
++	return false
 +}
 +
 +func (t *OpenCodeTaskTool) handleQuestionAsked(raw json.RawMessage, sessionID, channel, chatID string, sseErr chan<- error) {
