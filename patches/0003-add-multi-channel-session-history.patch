@@ -1,5 +1,5 @@
 diff --git a/web/backend/api/session.go b/web/backend/api/session.go
-index a2e9310..0cb2b60 100644
+index a2e9310..4605635 100644
 --- a/web/backend/api/session.go
 +++ b/web/backend/api/session.go
 @@ -35,6 +35,7 @@ type sessionFile struct {
@@ -34,7 +34,7 @@ index a2e9310..0cb2b60 100644
  	// Keep the session API aligned with the shared JSONL store reader limit in
  	// pkg/memory/jsonl.go so oversized lines fail consistently everywhere.
  	maxSessionJSONLLineSize = 10 * 1024 * 1024
-@@ -76,28 +77,57 @@ const (
+@@ -76,28 +77,66 @@ const (
  	handledToolResponseSummaryText = "Requested output delivered via tool attachment."
  )
  
@@ -71,20 +71,29 @@ index a2e9310..0cb2b60 100644
 -func extractPicoSessionIDFromSanitizedKey(key string) (string, bool) {
 -	if strings.HasPrefix(key, sanitizedPicoSessionPrefix) {
 -		return strings.TrimPrefix(key, sanitizedPicoSessionPrefix), true
-+// channelFromSessionKey extracts the channel name from an unsanitized session
-+// key like "agent:main:discord:direct:123". Returns empty string if the key
-+// does not match the expected colon-separated format.
++// channelFromSessionKey extracts the channel name from a session key.
++// It first tries the unsanitized colon-separated form
++// ("agent:main:discord:direct:123"), then falls back to the sanitized
++// underscore-separated form ("agent_main_discord_direct_123").
++// The sanitized fallback is ambiguous for underscore-containing channel
++// names (e.g. "whatsapp_native"), but correctly handles common channels.
 +func channelFromSessionKey(key string) string {
-+	if !strings.HasPrefix(key, sessionKeyPrefix) {
-+		return ""
++	if strings.HasPrefix(key, sessionKeyPrefix) {
++		rest := strings.TrimPrefix(key, sessionKeyPrefix)
++		parts := strings.SplitN(rest, ":", 2)
++		if len(parts) >= 2 && parts[0] != "" {
++			return parts[0]
++		}
  	}
 -	return "", false
-+	rest := strings.TrimPrefix(key, sessionKeyPrefix)
-+	parts := strings.SplitN(rest, ":", 2)
-+	if len(parts) < 2 || parts[0] == "" {
-+		return ""
++	if strings.HasPrefix(key, sanitizedSessionKeyPrefix) {
++		rest := strings.TrimPrefix(key, sanitizedSessionKeyPrefix)
++		parts := strings.SplitN(rest, "_", 2)
++		if len(parts) >= 2 && parts[0] != "" {
++			return parts[0]
++		}
 +	}
-+	return parts[0]
++	return ""
  }
  
 +// sanitizeSessionKey mirrors pkg/session.sanitizeFilename and
@@ -104,7 +113,7 @@ index a2e9310..0cb2b60 100644
  	data, err := os.ReadFile(path)
  	if err != nil {
  		return sessionFile{}, err
-@@ -164,13 +194,12 @@ func (h *Handler) readSessionMessages(path string, skip int) ([]providers.Messag
+@@ -164,13 +203,12 @@ func (h *Handler) readSessionMessages(path string, skip int) ([]providers.Messag
  	return msgs, nil
  }
  
@@ -121,7 +130,7 @@ index a2e9310..0cb2b60 100644
  	if err != nil {
  		return sessionFile{}, err
  	}
-@@ -202,7 +231,7 @@ func (h *Handler) readJSONLSession(dir, sessionID string) (sessionFile, error) {
+@@ -202,7 +240,7 @@ func (h *Handler) readJSONLSession(dir, sessionID string) (sessionFile, error) {
  	}, nil
  }
  
@@ -130,7 +139,7 @@ index a2e9310..0cb2b60 100644
  	preview := ""
  	for _, msg := range sess.Messages {
  		if msg.Role == "user" {
-@@ -223,6 +252,7 @@ func buildSessionListItem(sessionID string, sess sessionFile) sessionListItem {
+@@ -223,6 +261,7 @@ func buildSessionListItem(sessionID string, sess sessionFile) sessionListItem {
  
  	return sessionListItem{
  		ID:           sessionID,
@@ -138,7 +147,7 @@ index a2e9310..0cb2b60 100644
  		Title:        title,
  		Preview:      preview,
  		MessageCount: validMessageCount,
-@@ -366,7 +396,7 @@ func (h *Handler) sessionsDir() (string, error) {
+@@ -366,7 +405,7 @@ func (h *Handler) sessionsDir() (string, error) {
  	return filepath.Join(workspace, "sessions"), nil
  }
  
@@ -147,7 +156,7 @@ index a2e9310..0cb2b60 100644
  //
  //	GET /api/sessions
  func (h *Handler) handleListSessions(w http.ResponseWriter, r *http.Request) {
-@@ -378,7 +408,6 @@ func (h *Handler) handleListSessions(w http.ResponseWriter, r *http.Request) {
+@@ -378,7 +417,6 @@ func (h *Handler) handleListSessions(w http.ResponseWriter, r *http.Request) {
  
  	entries, err := os.ReadDir(dir)
  	if err != nil {
@@ -155,7 +164,7 @@ index a2e9310..0cb2b60 100644
  		w.Header().Set("Content-Type", "application/json")
  		json.NewEncoder(w).Encode([]sessionListItem{})
  		return
-@@ -394,19 +423,19 @@ func (h *Handler) handleListSessions(w http.ResponseWriter, r *http.Request) {
+@@ -394,19 +432,19 @@ func (h *Handler) handleListSessions(w http.ResponseWriter, r *http.Request) {
  
  		name := entry.Name()
  		var (
@@ -181,7 +190,7 @@ index a2e9310..0cb2b60 100644
  			if loadErr == nil && isEmptySession(sess) {
  				continue
  			}
-@@ -415,10 +444,10 @@ func (h *Handler) handleListSessions(w http.ResponseWriter, r *http.Request) {
+@@ -415,10 +453,10 @@ func (h *Handler) handleListSessions(w http.ResponseWriter, r *http.Request) {
  		case filepath.Ext(name) == ".json":
  			base := strings.TrimSuffix(name, ".json")
  			if _, statErr := os.Stat(filepath.Join(dir, base+".jsonl")); statErr == nil {
@@ -194,7 +203,7 @@ index a2e9310..0cb2b60 100644
  					); jsonlErr == nil &&
  						!isEmptySession(jsonlSess) {
  						continue
-@@ -435,11 +464,11 @@ func (h *Handler) handleListSessions(w http.ResponseWriter, r *http.Request) {
+@@ -435,11 +473,11 @@ func (h *Handler) handleListSessions(w http.ResponseWriter, r *http.Request) {
  			if isEmptySession(sess) {
  				continue
  			}
@@ -208,7 +217,7 @@ index a2e9310..0cb2b60 100644
  				continue
  			}
  		default:
-@@ -449,12 +478,13 @@ func (h *Handler) handleListSessions(w http.ResponseWriter, r *http.Request) {
+@@ -449,12 +487,13 @@ func (h *Handler) handleListSessions(w http.ResponseWriter, r *http.Request) {
  		if loadErr != nil {
  			continue
  		}
@@ -225,7 +234,7 @@ index a2e9310..0cb2b60 100644
  	}
  
  	// Sort by updated descending (most recent first)
-@@ -501,6 +531,14 @@ func (h *Handler) handleGetSession(w http.ResponseWriter, r *http.Request) {
+@@ -501,6 +540,14 @@ func (h *Handler) handleGetSession(w http.ResponseWriter, r *http.Request) {
  		http.Error(w, "missing session id", http.StatusBadRequest)
  		return
  	}
@@ -240,7 +249,7 @@ index a2e9310..0cb2b60 100644
  
  	dir, err := h.sessionsDir()
  	if err != nil {
-@@ -513,11 +551,13 @@ func (h *Handler) handleGetSession(w http.ResponseWriter, r *http.Request) {
+@@ -513,11 +560,13 @@ func (h *Handler) handleGetSession(w http.ResponseWriter, r *http.Request) {
  		err = os.ErrNotExist
  	}
  	if err != nil {
@@ -259,7 +268,7 @@ index a2e9310..0cb2b60 100644
  		}
  		if err != nil {
  			if errors.Is(err, os.ErrNotExist) {
-@@ -550,6 +590,14 @@ func (h *Handler) handleDeleteSession(w http.ResponseWriter, r *http.Request) {
+@@ -550,6 +599,14 @@ func (h *Handler) handleDeleteSession(w http.ResponseWriter, r *http.Request) {
  		http.Error(w, "missing session id", http.StatusBadRequest)
  		return
  	}
@@ -274,7 +283,7 @@ index a2e9310..0cb2b60 100644
  
  	dir, err := h.sessionsDir()
  	if err != nil {
-@@ -557,7 +605,7 @@ func (h *Handler) handleDeleteSession(w http.ResponseWriter, r *http.Request) {
+@@ -557,7 +614,7 @@ func (h *Handler) handleDeleteSession(w http.ResponseWriter, r *http.Request) {
  		return
  	}
  
@@ -284,7 +293,7 @@ index a2e9310..0cb2b60 100644
  	metaPath := base + ".meta.json"
  	legacyPath := base + ".json"
 diff --git a/web/backend/api/session_test.go b/web/backend/api/session_test.go
-index 9248c11..f233acd 100644
+index 9248c11..a556e16 100644
 --- a/web/backend/api/session_test.go
 +++ b/web/backend/api/session_test.go
 @@ -15,6 +15,8 @@ import (
@@ -515,7 +524,7 @@ index 9248c11..f233acd 100644
  	if err := os.WriteFile(base+".jsonl", []byte{}, 0o644); err != nil {
  		t.Fatalf("WriteFile(jsonl) error = %v", err)
  	}
-@@ -667,11 +680,406 @@ func TestHandleSessions_FiltersEmptyJSONLFiles(t *testing.T) {
+@@ -667,11 +680,408 @@ func TestHandleSessions_FiltersEmptyJSONLFiles(t *testing.T) {
  		t.Fatalf("len(items) = %d, want 0", len(items))
  	}
  
@@ -787,7 +796,9 @@ index 9248c11..f233acd 100644
 +		{"agent:main:pico:direct:pico:abc", "pico"},
 +		{"agent:main:telegram:channel:789", "telegram"},
 +		{"agent:main:pico_client:direct:xyz", "pico_client"},
-+		{"agent_main_discord_direct_123", ""},
++		{"agent_main_discord_direct_123", "discord"},
++		{"agent_main_pico_direct_pico_abc", "pico"},
++		{"agent_main_", ""},
 +		{"unrelated", ""},
 +		{"agent:main:", ""},
 +		{"", ""},
@@ -936,7 +947,7 @@ index dd0fa1f..ae4deed 100644
    preview: string
    message_count: number
 diff --git a/web/frontend/src/components/chat/session-history-menu.tsx b/web/frontend/src/components/chat/session-history-menu.tsx
-index 3ec1a5e..4822641 100644
+index 3ec1a5e..9477bcc 100644
 --- a/web/frontend/src/components/chat/session-history-menu.tsx
 +++ b/web/frontend/src/components/chat/session-history-menu.tsx
 @@ -1,4 +1,4 @@
@@ -953,7 +964,7 @@ index 3ec1a5e..4822641 100644
  
  interface SessionHistoryMenuProps {
    sessions: SessionSummary[]
-@@ -62,24 +63,27 @@ export function SessionHistoryMenu({
+@@ -62,24 +63,32 @@ export function SessionHistoryMenu({
                </span>
              </DropdownMenuItem>
            ) : (
@@ -981,7 +992,12 @@ index 3ec1a5e..4822641 100644
 +                <DropdownMenuItem
 +                  key={session.id}
 +                  className={`group relative my-0.5 flex flex-col items-start gap-0.5 pr-8 ${
-+                    session.id === activeSessionId ? "bg-accent" : ""
++                    session.id === activeSessionId ||
++                    (activeSessionId &&
++                      !activeSessionId.startsWith("agent_main_") &&
++                      session.id.endsWith("_" + activeSessionId))
++                      ? "bg-accent"
++                      : ""
 +                  }`}
 +                  onClick={() => onSwitchSession(session.id)}
 +                >
@@ -999,7 +1015,7 @@ index 3ec1a5e..4822641 100644
                    variant="ghost"
                    size="icon"
                    aria-label={t("chat.deleteSession")}
-@@ -93,8 +97,8 @@ export function SessionHistoryMenu({
+@@ -93,8 +102,8 @@ export function SessionHistoryMenu({
                    <IconTrash className="h-4 w-4" />
                  </Button>
                </DropdownMenuItem>
@@ -1010,6 +1026,29 @@ index 3ec1a5e..4822641 100644
            {hasMore && sessions.length > 0 && (
              <div ref={observerRef} className="py-2 text-center">
                <span className="text-muted-foreground animate-pulse text-xs">
+diff --git a/web/frontend/src/features/chat/controller.ts b/web/frontend/src/features/chat/controller.ts
+index c5c93d2..d94e3a2 100644
+--- a/web/frontend/src/features/chat/controller.ts
++++ b/web/frontend/src/features/chat/controller.ts
+@@ -407,7 +407,17 @@ export async function switchChatSession(sessionId: string) {
+       hasHydratedActiveSession: true,
+     })
+ 
+-    if (store.get(gatewayAtom).status === "running") {
++    // Only reconnect WebSocket for Pico sessions. Non-Pico sessions
++    // (e.g. Discord, Telegram) are read-only history views — the Pico
++    // WebSocket endpoint cannot handle their session IDs.
++    const isPicoSession =
++      sessionId.startsWith("agent_main_pico_") ||
++      !sessionId.startsWith("agent_main_")
++    if (isPicoSession && store.get(gatewayAtom).status === "running") {
+       shouldMaintainConnection = true
+       await connectChat()
++    } else {
++      // Prevent stale reconnection attempts after viewing non-Pico
++      // session history (e.g. on page reload or gateway restart).
++      shouldMaintainConnection = false
+     }
 diff --git a/web/frontend/src/hooks/use-sidebar-channels.ts b/web/frontend/src/hooks/use-sidebar-channels.ts
 index 22fc24e..9b1f1d4 100644
 --- a/web/frontend/src/hooks/use-sidebar-channels.ts
