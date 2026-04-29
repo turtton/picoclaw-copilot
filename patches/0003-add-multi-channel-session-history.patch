@@ -1,8 +1,8 @@
 diff --git a/web/backend/api/session.go b/web/backend/api/session.go
-index a2e9310..4605635 100644
+index 0143f57..3092cfe 100644
 --- a/web/backend/api/session.go
 +++ b/web/backend/api/session.go
-@@ -35,6 +35,7 @@ type sessionFile struct {
+@@ -38,6 +38,7 @@ type sessionFile struct {
  // sessionListItem is a lightweight summary returned by GET /api/sessions.
  type sessionListItem struct {
  	ID           string `json:"id"`
@@ -10,82 +10,24 @@ index a2e9310..4605635 100644
  	Title        string `json:"title"`
  	Preview      string `json:"preview"`
  	MessageCount int    `json:"message_count"`
-@@ -57,17 +58,17 @@ type sessionMetaFile struct {
- 	UpdatedAt time.Time `json:"updated_at"`
+@@ -86,6 +87,46 @@ func sanitizeSessionKey(key string) string {
+ 	return key
  }
  
--// picoSessionPrefix is the key prefix used by the gateway's routing for Pico
--// channel sessions. The full key format is:
-+// sessionKeyPrefix is the common prefix for all channel session keys.
-+// The full key format is:
- //
--//	agent:main:pico:direct:pico:<session-uuid>
-+//	agent:main:<channel>:<peer_kind>:<peer_id>
- //
- // The sanitized filename replaces ':' with '_', so on disk it becomes:
- //
--//	agent_main_pico_direct_pico_<session-uuid>.json
-+//	agent_main_<channel>_<peer_kind>_<peer_id>.jsonl
- const (
--	picoSessionPrefix          = "agent:main:pico:direct:pico:"
--	sanitizedPicoSessionPrefix = "agent_main_pico_direct_pico_"
-+	sessionKeyPrefix          = "agent:main:"
-+	sanitizedSessionKeyPrefix = "agent_main_"
- 	// Keep the session API aligned with the shared JSONL store reader limit in
- 	// pkg/memory/jsonl.go so oversized lines fail consistently everywhere.
- 	maxSessionJSONLLineSize = 10 * 1024 * 1024
-@@ -76,28 +77,66 @@ const (
- 	handledToolResponseSummaryText = "Requested output delivered via tool attachment."
- )
- 
--// extractPicoSessionID extracts the session UUID from a full session key.
--// Returns the UUID and true if the key matches the Pico session pattern.
--func extractPicoSessionID(key string) (string, bool) {
--	if strings.HasPrefix(key, picoSessionPrefix) {
--		return strings.TrimPrefix(key, picoSessionPrefix), true
-+// isSessionKey reports whether key (sanitized or unsanitized) looks like a
-+// valid session storage key and returns the sanitized form suitable for
-+// filename lookups. Channel extraction is intentionally NOT done here because
-+// sanitized filenames are ambiguous for underscore-containing channel names
-+// (e.g. whatsapp_native). Use channelFromSessionKey on the original
-+// unsanitized key (sess.Key / meta.Key) instead.
-+func isSessionKey(key string) (sanitizedID string, ok bool) {
-+	if strings.HasPrefix(key, sessionKeyPrefix) {
-+		rest := strings.TrimPrefix(key, sessionKeyPrefix)
-+		parts := strings.SplitN(rest, ":", 2)
-+		if len(parts) < 2 || parts[0] == "" {
-+			return "", false
-+		}
-+		return sanitizeSessionKey(key), true
-+	}
-+	if strings.HasPrefix(key, sanitizedSessionKeyPrefix) {
-+		rest := strings.TrimPrefix(key, sanitizedSessionKeyPrefix)
-+		if rest == "" {
-+			return "", false
-+		}
-+		return key, true
- 	}
- 	return "", false
- }
- 
--func extractPicoSessionIDFromSanitizedKey(key string) (string, bool) {
--	if strings.HasPrefix(key, sanitizedPicoSessionPrefix) {
--		return strings.TrimPrefix(key, sanitizedPicoSessionPrefix), true
 +// channelFromSessionKey extracts the channel name from a session key.
 +// It first tries the unsanitized colon-separated form
 +// ("agent:main:discord:direct:123"), then falls back to the sanitized
 +// underscore-separated form ("agent_main_discord_direct_123").
-+// The sanitized fallback is ambiguous for underscore-containing channel
-+// names (e.g. "whatsapp_native"), but correctly handles common channels.
 +func channelFromSessionKey(key string) string {
++	const sessionKeyPrefix = "agent:main:"
++	const sanitizedSessionKeyPrefix = "agent_main_"
 +	if strings.HasPrefix(key, sessionKeyPrefix) {
 +		rest := strings.TrimPrefix(key, sessionKeyPrefix)
 +		parts := strings.SplitN(rest, ":", 2)
 +		if len(parts) >= 2 && parts[0] != "" {
 +			return parts[0]
 +		}
- 	}
--	return "", false
++	}
 +	if strings.HasPrefix(key, sanitizedSessionKeyPrefix) {
 +		rest := strings.TrimPrefix(key, sanitizedSessionKeyPrefix)
 +		parts := strings.SplitN(rest, "_", 2)
@@ -94,52 +36,143 @@ index a2e9310..4605635 100644
 +		}
 +	}
 +	return ""
- }
- 
-+// sanitizeSessionKey mirrors pkg/session.sanitizeFilename and
-+// pkg/memory/jsonl.sanitizeKey so that API IDs match on-disk filenames.
- func sanitizeSessionKey(key string) string {
--	return strings.ReplaceAll(key, ":", "_")
-+	s := strings.ReplaceAll(key, ":", "_")
-+	s = strings.ReplaceAll(s, "/", "_")
-+	s = strings.ReplaceAll(s, "\\", "_")
-+	return s
- }
- 
--func (h *Handler) readLegacySession(dir, sessionID string) (sessionFile, error) {
--	path := filepath.Join(dir, sanitizeSessionKey(picoSessionPrefix+sessionID)+".json")
-+func (h *Handler) readLegacySession(dir, sanitizedKey string) (sessionFile, error) {
-+	path := filepath.Join(dir, sanitizedKey+".json")
++}
++
++// isValidSessionID checks that the session ID is safe for filesystem use.
++// It rejects empty strings, absolute paths, and any path containing
++// directory separators or ".." components to prevent traversal attacks.
++func isValidSessionID(id string) bool {
++	if id == "" || id == "." || id == ".." {
++		return false
++	}
++	if strings.ContainsAny(id, "/\\") {
++		return false
++	}
++	if strings.Contains(id, "..") {
++		return false
++	}
++	return true
++}
++
+ func (h *Handler) readLegacySession(path string) (sessionFile, error) {
  	data, err := os.ReadFile(path)
  	if err != nil {
- 		return sessionFile{}, err
-@@ -164,13 +203,12 @@ func (h *Handler) readSessionMessages(path string, skip int) ([]providers.Messag
- 	return msgs, nil
+@@ -200,6 +241,12 @@ type picoLegacySessionRef struct {
+ 	Path string
  }
  
--func (h *Handler) readJSONLSession(dir, sessionID string) (sessionFile, error) {
--	sessionKey := picoSessionPrefix + sessionID
--	base := filepath.Join(dir, sanitizeSessionKey(sessionKey))
-+func (h *Handler) readJSONLSession(dir, sanitizedKey string) (sessionFile, error) {
-+	base := filepath.Join(dir, sanitizedKey)
- 	jsonlPath := base + ".jsonl"
- 	metaPath := base + ".meta.json"
++type nonPicoSessionRef struct {
++	SanitizedKey string
++	Key          string
++	Channel      string
++}
++
+ func extractPicoSessionIDFromScope(scope session.SessionScope) (string, bool) {
+ 	if !strings.EqualFold(strings.TrimSpace(scope.Channel), "pico") {
+ 		return "", false
+@@ -397,7 +444,100 @@ func (h *Handler) findLegacyPicoSession(dir, sessionID string) (picoLegacySessio
+ 	return picoLegacySessionRef{}, os.ErrNotExist
+ }
  
--	meta, err := h.readSessionMeta(metaPath, sessionKey)
+-func buildSessionListItem(sessionID string, sess sessionFile, toolFeedbackMaxArgsLength int) sessionListItem {
++func channelFromMeta(meta memory.SessionMeta) string {
++	if len(meta.Scope) > 0 {
++		var scope session.SessionScope
++		if err := json.Unmarshal(meta.Scope, &scope); err == nil && strings.TrimSpace(scope.Channel) != "" {
++			return strings.TrimSpace(scope.Channel)
++		}
++	}
++	if meta.Key != "" {
++		return channelFromSessionKey(meta.Key)
++	}
++	return ""
++}
++
++func (h *Handler) findNonPicoJSONLSessions(dir string) ([]nonPicoSessionRef, error) {
++	entries, err := os.ReadDir(dir)
++	if err != nil {
++		return nil, err
++	}
++
++	refs := make([]nonPicoSessionRef, 0)
++	seen := make(map[string]struct{})
++
++	for _, entry := range entries {
++		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".meta.json") {
++			continue
++		}
++		name := entry.Name()
++		metaPath := filepath.Join(dir, name)
++		meta, err := h.readSessionMeta(metaPath, "")
++		if err != nil {
++			continue
++		}
++
++		channel := channelFromMeta(meta)
++		if channel == "" || strings.EqualFold(channel, "pico") {
++			continue
++		}
++
++		base := strings.TrimSuffix(name, ".meta.json")
++		jsonlPath := filepath.Join(dir, base+".jsonl")
++		if _, statErr := os.Stat(jsonlPath); statErr != nil {
++			continue
++		}
++
++		if _, exists := seen[base]; exists {
++			continue
++		}
++		seen[base] = struct{}{}
++
++		key := meta.Key
++		if key == "" {
++			key = base
++		}
++
++		refs = append(refs, nonPicoSessionRef{
++			SanitizedKey: base,
++			Key:          key,
++			Channel:      channel,
++		})
++	}
++
++	return refs, nil
++}
++
++func (h *Handler) findNonPicoJSONLSession(dir, sanitizedKey string) (nonPicoSessionRef, error) {
++	jsonlPath := filepath.Join(dir, sanitizedKey+".jsonl")
++	if _, err := os.Stat(jsonlPath); err != nil {
++		return nonPicoSessionRef{}, os.ErrNotExist
++	}
++
++	metaPath := filepath.Join(dir, sanitizedKey+".meta.json")
 +	meta, err := h.readSessionMeta(metaPath, sanitizedKey)
- 	if err != nil {
- 		return sessionFile{}, err
- 	}
-@@ -202,7 +240,7 @@ func (h *Handler) readJSONLSession(dir, sessionID string) (sessionFile, error) {
- 	}, nil
- }
- 
--func buildSessionListItem(sessionID string, sess sessionFile) sessionListItem {
-+func buildSessionListItem(sessionID string, channel string, sess sessionFile) sessionListItem {
++	if err != nil {
++		return nonPicoSessionRef{}, err
++	}
++
++	channel := channelFromMeta(meta)
++	if channel == "" || strings.EqualFold(channel, "pico") {
++		return nonPicoSessionRef{}, os.ErrNotExist
++	}
++
++	key := meta.Key
++	if key == "" {
++		key = sanitizedKey
++	}
++
++	return nonPicoSessionRef{
++		SanitizedKey: sanitizedKey,
++		Key:          key,
++		Channel:      channel,
++	}, nil
++}
++
++func buildSessionListItem(sessionID string, channel string, sess sessionFile, toolFeedbackMaxArgsLength int) sessionListItem {
  	preview := ""
  	for _, msg := range sess.Messages {
  		if msg.Role == "user" {
-@@ -223,6 +261,7 @@ func buildSessionListItem(sessionID string, sess sessionFile) sessionListItem {
+@@ -418,6 +558,7 @@ func buildSessionListItem(sessionID string, sess sessionFile, toolFeedbackMaxArg
  
  	return sessionListItem{
  		ID:           sessionID,
@@ -147,395 +180,128 @@ index a2e9310..4605635 100644
  		Title:        title,
  		Preview:      preview,
  		MessageCount: validMessageCount,
-@@ -366,7 +405,7 @@ func (h *Handler) sessionsDir() (string, error) {
- 	return filepath.Join(workspace, "sessions"), nil
- }
- 
--// handleListSessions returns a list of Pico session summaries.
-+// handleListSessions returns a list of session summaries across all channels.
- //
- //	GET /api/sessions
- func (h *Handler) handleListSessions(w http.ResponseWriter, r *http.Request) {
-@@ -378,7 +417,6 @@ func (h *Handler) handleListSessions(w http.ResponseWriter, r *http.Request) {
- 
- 	entries, err := os.ReadDir(dir)
- 	if err != nil {
--		// Directory doesn't exist yet = no sessions
- 		w.Header().Set("Content-Type", "application/json")
- 		json.NewEncoder(w).Encode([]sessionListItem{})
- 		return
-@@ -394,19 +432,19 @@ func (h *Handler) handleListSessions(w http.ResponseWriter, r *http.Request) {
- 
- 		name := entry.Name()
- 		var (
--			sessionID string
--			sess      sessionFile
--			loadErr   error
--			ok        bool
-+			sanitizedID string
-+			sess        sessionFile
-+			loadErr     error
-+			ok          bool
- 		)
- 
- 		switch {
- 		case strings.HasSuffix(name, ".jsonl"):
--			sessionID, ok = extractPicoSessionIDFromSanitizedKey(strings.TrimSuffix(name, ".jsonl"))
-+			sanitizedID, ok = isSessionKey(strings.TrimSuffix(name, ".jsonl"))
- 			if !ok {
+@@ -689,7 +830,7 @@ func (h *Handler) handleListSessions(w http.ResponseWriter, r *http.Request) {
  				continue
  			}
--			sess, loadErr = h.readJSONLSession(dir, sessionID)
-+			sess, loadErr = h.readJSONLSession(dir, sanitizedID)
- 			if loadErr == nil && isEmptySession(sess) {
- 				continue
- 			}
-@@ -415,10 +453,10 @@ func (h *Handler) handleListSessions(w http.ResponseWriter, r *http.Request) {
- 		case filepath.Ext(name) == ".json":
- 			base := strings.TrimSuffix(name, ".json")
- 			if _, statErr := os.Stat(filepath.Join(dir, base+".jsonl")); statErr == nil {
--				if jsonlSessionID, found := extractPicoSessionIDFromSanitizedKey(base); found {
-+				if jsonlSanitizedID, found := isSessionKey(base); found {
- 					if jsonlSess, jsonlErr := h.readJSONLSession(
- 						dir,
--						jsonlSessionID,
-+						jsonlSanitizedID,
- 					); jsonlErr == nil &&
- 						!isEmptySession(jsonlSess) {
- 						continue
-@@ -435,11 +473,11 @@ func (h *Handler) handleListSessions(w http.ResponseWriter, r *http.Request) {
- 			if isEmptySession(sess) {
- 				continue
- 			}
--			sessionID, ok = extractPicoSessionID(sess.Key)
-+			sanitizedID, ok = isSessionKey(sess.Key)
- 			if !ok {
- 				continue
- 			}
--			if _, exists := seen[sessionID]; exists {
-+			if _, exists := seen[sanitizedID]; exists {
- 				continue
- 			}
- 		default:
-@@ -449,12 +487,13 @@ func (h *Handler) handleListSessions(w http.ResponseWriter, r *http.Request) {
- 		if loadErr != nil {
- 			continue
+ 			seen[ref.ID] = struct{}{}
+-			items = append(items, buildSessionListItem(ref.ID, sess, toolFeedbackMaxArgsLength))
++			items = append(items, buildSessionListItem(ref.ID, "pico", sess, toolFeedbackMaxArgsLength))
  		}
--		if _, exists := seen[sessionID]; exists {
-+		if _, exists := seen[sanitizedID]; exists {
- 			continue
- 		}
- 
--		seen[sessionID] = struct{}{}
--		items = append(items, buildSessionListItem(sessionID, sess))
-+		channel := channelFromSessionKey(sess.Key)
-+		seen[sanitizedID] = struct{}{}
-+		items = append(items, buildSessionListItem(sanitizedID, channel, sess))
  	}
  
- 	// Sort by updated descending (most recent first)
-@@ -501,6 +540,14 @@ func (h *Handler) handleGetSession(w http.ResponseWriter, r *http.Request) {
+@@ -703,7 +844,21 @@ func (h *Handler) handleListSessions(w http.ResponseWriter, r *http.Request) {
+ 				continue
+ 			}
+ 			seen[ref.ID] = struct{}{}
+-			items = append(items, buildSessionListItem(ref.ID, sess, toolFeedbackMaxArgsLength))
++			items = append(items, buildSessionListItem(ref.ID, "pico", sess, toolFeedbackMaxArgsLength))
++		}
++	}
++
++	if nonPicoRefs, findErr := h.findNonPicoJSONLSessions(dir); findErr == nil {
++		for _, ref := range nonPicoRefs {
++			sess, loadErr := h.readJSONLSession(dir, ref.Key)
++			if loadErr != nil || isEmptySession(sess) {
++				continue
++			}
++			if _, exists := seen[ref.SanitizedKey]; exists {
++				continue
++			}
++			seen[ref.SanitizedKey] = struct{}{}
++			items = append(items, buildSessionListItem(ref.SanitizedKey, ref.Channel, sess, toolFeedbackMaxArgsLength))
+ 		}
+ 	}
+ 
+@@ -751,6 +906,10 @@ func (h *Handler) handleGetSession(w http.ResponseWriter, r *http.Request) {
  		http.Error(w, "missing session id", http.StatusBadRequest)
  		return
  	}
-+	if !filepath.IsLocal(sessionID) {
-+		http.Error(w, "invalid session id", http.StatusBadRequest)
-+		return
-+	}
-+	if _, ok := isSessionKey(sessionID); !ok {
++	if !isValidSessionID(sessionID) {
 +		http.Error(w, "invalid session id", http.StatusBadRequest)
 +		return
 +	}
  
- 	dir, err := h.sessionsDir()
+ 	dir, toolFeedbackMaxArgsLength, err := h.sessionRuntimeSettings()
  	if err != nil {
-@@ -513,11 +560,13 @@ func (h *Handler) handleGetSession(w http.ResponseWriter, r *http.Request) {
+@@ -768,14 +927,24 @@ func (h *Handler) handleGetSession(w http.ResponseWriter, r *http.Request) {
  		err = os.ErrNotExist
  	}
  	if err != nil {
 -		if errors.Is(err, os.ErrNotExist) {
--			sess, err = h.readLegacySession(dir, sessionID)
--			if err == nil && isEmptySession(sess) {
--				err = os.ErrNotExist
+-			if legacyRef, legacyErr := h.findLegacyPicoSession(dir, sessionID); legacyErr == nil {
+-				sess, err = h.readLegacySession(legacyRef.Path)
 -			}
 +		// Fall back to legacy JSON on any JSONL read failure (not just
 +		// ErrNotExist) so that a corrupt/broken .jsonl with a valid
 +		// legacy .json still serves the session—matching the fallback
 +		// behaviour in handleListSessions.
-+		sess, err = h.readLegacySession(dir, sessionID)
-+		if err == nil && isEmptySession(sess) {
-+			err = os.ErrNotExist
++		if legacyRef, legacyErr := h.findLegacyPicoSession(dir, sessionID); legacyErr == nil {
++			sess, err = h.readLegacySession(legacyRef.Path)
+ 			if err == nil && isEmptySession(sess) {
+ 				err = os.ErrNotExist
+ 			}
  		}
++		if err != nil {
++			if nonPicoRef, nonPicoErr := h.findNonPicoJSONLSession(dir, sessionID); nonPicoErr == nil {
++				sess, err = h.readJSONLSession(dir, nonPicoRef.Key)
++				if err == nil && isEmptySession(sess) {
++					err = os.ErrNotExist
++				}
++			}
++		}
  		if err != nil {
  			if errors.Is(err, os.ErrNotExist) {
-@@ -550,6 +599,14 @@ func (h *Handler) handleDeleteSession(w http.ResponseWriter, r *http.Request) {
+ 				http.Error(w, "session not found", http.StatusNotFound)
+@@ -807,6 +976,10 @@ func (h *Handler) handleDeleteSession(w http.ResponseWriter, r *http.Request) {
  		http.Error(w, "missing session id", http.StatusBadRequest)
  		return
  	}
-+	if !filepath.IsLocal(sessionID) {
-+		http.Error(w, "invalid session id", http.StatusBadRequest)
-+		return
-+	}
-+	if _, ok := isSessionKey(sessionID); !ok {
++	if !isValidSessionID(sessionID) {
 +		http.Error(w, "invalid session id", http.StatusBadRequest)
 +		return
 +	}
  
  	dir, err := h.sessionsDir()
  	if err != nil {
-@@ -557,7 +614,7 @@ func (h *Handler) handleDeleteSession(w http.ResponseWriter, r *http.Request) {
- 		return
+@@ -840,6 +1013,22 @@ func (h *Handler) handleDeleteSession(w http.ResponseWriter, r *http.Request) {
+ 		}
  	}
  
--	base := filepath.Join(dir, sanitizeSessionKey(picoSessionPrefix+sessionID))
-+	base := filepath.Join(dir, sessionID)
- 	jsonlPath := base + ".jsonl"
- 	metaPath := base + ".meta.json"
- 	legacyPath := base + ".json"
++	if !removed {
++		if nonPicoRef, nonPicoErr := h.findNonPicoJSONLSession(dir, sessionID); nonPicoErr == nil {
++			base := filepath.Join(dir, nonPicoRef.SanitizedKey)
++			for _, path := range []string{base + ".jsonl", base + ".meta.json"} {
++				if err := os.Remove(path); err != nil {
++					if os.IsNotExist(err) {
++						continue
++					}
++					http.Error(w, "failed to delete session", http.StatusInternalServerError)
++					return
++				}
++				removed = true
++			}
++		}
++	}
++
+ 	if !removed {
+ 		http.Error(w, "session not found", http.StatusNotFound)
+ 		return
 diff --git a/web/backend/api/session_test.go b/web/backend/api/session_test.go
-index 9248c11..a556e16 100644
+index f6c643b..0a5cbaf 100644
 --- a/web/backend/api/session_test.go
 +++ b/web/backend/api/session_test.go
-@@ -15,6 +15,8 @@ import (
- 	"github.com/sipeed/picoclaw/pkg/session"
- )
- 
-+const testPicoSessionPrefix = "agent:main:pico:direct:pico:"
-+
- func sessionsTestDir(t *testing.T, configPath string) string {
- 	t.Helper()
- 
-@@ -40,7 +42,7 @@ func TestHandleListSessions_JSONLStorage(t *testing.T) {
- 		t.Fatalf("NewJSONLStore() error = %v", err)
+@@ -86,6 +86,9 @@ func TestHandleListSessions_JSONLStorage(t *testing.T) {
+ 	if items[0].ID != "history-jsonl" {
+ 		t.Fatalf("items[0].ID = %q, want %q", items[0].ID, "history-jsonl")
  	}
- 
--	sessionKey := picoSessionPrefix + "history-jsonl"
-+	sessionKey := testPicoSessionPrefix + "history-jsonl"
- 	if err := store.AddFullMessage(nil, sessionKey, providers.Message{
- 		Role:    "user",
- 		Content: "Explain why the history API is empty after migration.",
-@@ -82,8 +84,12 @@ func TestHandleListSessions_JSONLStorage(t *testing.T) {
- 	if len(items) != 1 {
- 		t.Fatalf("len(items) = %d, want 1", len(items))
- 	}
--	if items[0].ID != "history-jsonl" {
--		t.Fatalf("items[0].ID = %q, want %q", items[0].ID, "history-jsonl")
-+	wantID := sanitizeSessionKey(sessionKey)
-+	if items[0].ID != wantID {
-+		t.Fatalf("items[0].ID = %q, want %q", items[0].ID, wantID)
-+	}
 +	if items[0].Channel != "pico" {
 +		t.Fatalf("items[0].Channel = %q, want %q", items[0].Channel, "pico")
- 	}
++	}
  	if items[0].MessageCount != 2 {
  		t.Fatalf("items[0].MessageCount = %d, want 2", items[0].MessageCount)
-@@ -110,7 +116,7 @@ func TestHandleListSessions_TitleUsesFirstUserMessage(t *testing.T) {
- 		t.Fatalf("NewJSONLStore() error = %v", err)
  	}
- 
--	sessionKey := picoSessionPrefix + "summary-title"
-+	sessionKey := testPicoSessionPrefix + "summary-title"
- 	if err := store.AddFullMessage(nil, sessionKey, providers.Message{
- 		Role:    "user",
- 		Content: "fallback preview",
-@@ -163,7 +169,7 @@ func TestHandleGetSession_JSONLStorage(t *testing.T) {
- 		t.Fatalf("NewJSONLStore() error = %v", err)
- 	}
- 
--	sessionKey := picoSessionPrefix + "detail-jsonl"
-+	sessionKey := testPicoSessionPrefix + "detail-jsonl"
- 	for _, msg := range []providers.Message{
- 		{Role: "user", Content: "first"},
- 		{Role: "assistant", Content: "second"},
-@@ -181,8 +187,9 @@ func TestHandleGetSession_JSONLStorage(t *testing.T) {
- 	mux := http.NewServeMux()
- 	h.RegisterRoutes(mux)
- 
-+	sanitizedID := sanitizeSessionKey(sessionKey)
- 	rec := httptest.NewRecorder()
--	req := httptest.NewRequest(http.MethodGet, "/api/sessions/detail-jsonl", nil)
-+	req := httptest.NewRequest(http.MethodGet, "/api/sessions/"+sanitizedID, nil)
- 	mux.ServeHTTP(rec, req)
- 
- 	if rec.Code != http.StatusOK {
-@@ -200,8 +207,8 @@ func TestHandleGetSession_JSONLStorage(t *testing.T) {
- 	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
- 		t.Fatalf("Unmarshal() error = %v", err)
- 	}
--	if resp.ID != "detail-jsonl" {
--		t.Fatalf("resp.ID = %q, want %q", resp.ID, "detail-jsonl")
-+	if resp.ID != sanitizedID {
-+		t.Fatalf("resp.ID = %q, want %q", resp.ID, sanitizedID)
- 	}
- 	if resp.Summary != "detail summary" {
- 		t.Fatalf("resp.Summary = %q, want %q", resp.Summary, "detail summary")
-@@ -227,7 +234,7 @@ func TestHandleGetSession_ReconstructsVisibleMessageToolOutput(t *testing.T) {
- 		t.Fatalf("NewJSONLStore() error = %v", err)
- 	}
- 
--	sessionKey := picoSessionPrefix + "detail-message-tool"
-+	sessionKey := testPicoSessionPrefix + "detail-message-tool"
- 	for _, msg := range []providers.Message{
- 		{Role: "user", Content: "test"},
- 		{
-@@ -256,8 +263,9 @@ func TestHandleGetSession_ReconstructsVisibleMessageToolOutput(t *testing.T) {
- 	mux := http.NewServeMux()
- 	h.RegisterRoutes(mux)
- 
-+	sanitizedID := sanitizeSessionKey(sessionKey)
- 	rec := httptest.NewRecorder()
--	req := httptest.NewRequest(http.MethodGet, "/api/sessions/detail-message-tool", nil)
-+	req := httptest.NewRequest(http.MethodGet, "/api/sessions/"+sanitizedID, nil)
- 	mux.ServeHTTP(rec, req)
- 
- 	if rec.Code != http.StatusOK {
-@@ -291,7 +299,7 @@ func TestHandleGetSession_PreservesFinalAssistantReplyAfterMessageToolOutput(t *
- 		t.Fatalf("NewJSONLStore() error = %v", err)
- 	}
- 
--	sessionKey := picoSessionPrefix + "detail-message-tool-final-reply"
-+	sessionKey := testPicoSessionPrefix + "detail-message-tool-final-reply"
- 	for _, msg := range []providers.Message{
- 		{Role: "user", Content: "test"},
- 		{
-@@ -319,8 +327,9 @@ func TestHandleGetSession_PreservesFinalAssistantReplyAfterMessageToolOutput(t *
- 	mux := http.NewServeMux()
- 	h.RegisterRoutes(mux)
- 
-+	sanitizedID := sanitizeSessionKey(sessionKey)
- 	rec := httptest.NewRecorder()
--	req := httptest.NewRequest(http.MethodGet, "/api/sessions/detail-message-tool-final-reply", nil)
-+	req := httptest.NewRequest(http.MethodGet, "/api/sessions/"+sanitizedID, nil)
- 	mux.ServeHTTP(rec, req)
- 
- 	if rec.Code != http.StatusOK {
-@@ -357,7 +366,7 @@ func TestHandleListSessions_MessageCountUsesVisibleTranscript(t *testing.T) {
- 		t.Fatalf("NewJSONLStore() error = %v", err)
- 	}
- 
--	sessionKey := picoSessionPrefix + "list-visible-count"
-+	sessionKey := testPicoSessionPrefix + "list-visible-count"
- 	for _, msg := range []providers.Message{
- 		{Role: "user", Content: "test"},
- 		{
-@@ -415,7 +424,7 @@ func TestHandleGetSession_IncludesMediaOnlyMessages(t *testing.T) {
- 		t.Fatalf("NewJSONLStore() error = %v", err)
- 	}
- 
--	sessionKey := picoSessionPrefix + "detail-media-only"
-+	sessionKey := testPicoSessionPrefix + "detail-media-only"
- 	if err := store.AddFullMessage(nil, sessionKey, providers.Message{
- 		Role:  "user",
- 		Media: []string{"data:image/png;base64,abc123"},
-@@ -427,8 +436,9 @@ func TestHandleGetSession_IncludesMediaOnlyMessages(t *testing.T) {
- 	mux := http.NewServeMux()
- 	h.RegisterRoutes(mux)
- 
-+	sanitizedID := sanitizeSessionKey(sessionKey)
- 	rec := httptest.NewRecorder()
--	req := httptest.NewRequest(http.MethodGet, "/api/sessions/detail-media-only", nil)
-+	req := httptest.NewRequest(http.MethodGet, "/api/sessions/"+sanitizedID, nil)
- 	mux.ServeHTTP(rec, req)
- 
- 	if rec.Code != http.StatusOK {
-@@ -463,7 +473,7 @@ func TestHandleSessions_SupportsJSONLMessagesUpToStoreCap(t *testing.T) {
- 		t.Fatalf("NewJSONLStore() error = %v", err)
- 	}
- 
--	sessionKey := picoSessionPrefix + "detail-large-jsonl"
-+	sessionKey := testPicoSessionPrefix + "detail-large-jsonl"
- 	largeContent := strings.Repeat("x", 9*1024*1024)
- 	if err := store.AddFullMessage(nil, sessionKey, providers.Message{
- 		Role:    "user",
-@@ -492,8 +502,9 @@ func TestHandleSessions_SupportsJSONLMessagesUpToStoreCap(t *testing.T) {
- 		t.Fatalf("len(items) = %d, want 1", len(items))
- 	}
- 
-+	sanitizedID := sanitizeSessionKey(sessionKey)
- 	detailRec := httptest.NewRecorder()
--	detailReq := httptest.NewRequest(http.MethodGet, "/api/sessions/detail-large-jsonl", nil)
-+	detailReq := httptest.NewRequest(http.MethodGet, "/api/sessions/"+sanitizedID, nil)
- 	mux.ServeHTTP(detailRec, detailReq)
- 
- 	if detailRec.Code != http.StatusOK {
-@@ -535,7 +546,7 @@ func TestHandleListSessions_UsesImagePreviewForMediaOnlyMessage(t *testing.T) {
- 		t.Fatalf("NewJSONLStore() error = %v", err)
- 	}
- 
--	sessionKey := picoSessionPrefix + "preview-media-only"
-+	sessionKey := testPicoSessionPrefix + "preview-media-only"
- 	if err := store.AddFullMessage(nil, sessionKey, providers.Message{
- 		Role:  "user",
- 		Media: []string{"data:image/png;base64,abc123"},
-@@ -580,7 +591,7 @@ func TestHandleDeleteSession_JSONLStorage(t *testing.T) {
- 		t.Fatalf("NewJSONLStore() error = %v", err)
- 	}
- 
--	sessionKey := picoSessionPrefix + "delete-jsonl"
-+	sessionKey := testPicoSessionPrefix + "delete-jsonl"
- 	if err := store.AddFullMessage(nil, sessionKey, providers.Message{
- 		Role:    "user",
- 		Content: "delete me",
-@@ -595,15 +606,16 @@ func TestHandleDeleteSession_JSONLStorage(t *testing.T) {
- 	mux := http.NewServeMux()
- 	h.RegisterRoutes(mux)
- 
-+	sanitizedID := sanitizeSessionKey(sessionKey)
- 	rec := httptest.NewRecorder()
--	req := httptest.NewRequest(http.MethodDelete, "/api/sessions/delete-jsonl", nil)
-+	req := httptest.NewRequest(http.MethodDelete, "/api/sessions/"+sanitizedID, nil)
- 	mux.ServeHTTP(rec, req)
- 
- 	if rec.Code != http.StatusNoContent {
- 		t.Fatalf("status = %d, want %d, body=%s", rec.Code, http.StatusNoContent, rec.Body.String())
- 	}
- 
--	base := filepath.Join(dir, sanitizeSessionKey(sessionKey))
-+	base := filepath.Join(dir, sanitizedID)
- 	for _, path := range []string{base + ".jsonl", base + ".meta.json"} {
- 		if _, err := os.Stat(path); !os.IsNotExist(err) {
- 			t.Fatalf("expected %s to be removed, stat err = %v", path, err)
-@@ -617,7 +629,7 @@ func TestHandleGetSession_LegacyJSONFallback(t *testing.T) {
- 
- 	dir := sessionsTestDir(t, configPath)
- 	manager := session.NewSessionManager(dir)
--	sessionKey := picoSessionPrefix + "legacy-json"
-+	sessionKey := testPicoSessionPrefix + "legacy-json"
- 	manager.AddMessage(sessionKey, "user", "legacy user")
- 	manager.AddMessage(sessionKey, "assistant", "legacy assistant")
- 	if err := manager.Save(sessionKey); err != nil {
-@@ -628,8 +640,9 @@ func TestHandleGetSession_LegacyJSONFallback(t *testing.T) {
- 	mux := http.NewServeMux()
- 	h.RegisterRoutes(mux)
- 
-+	sanitizedID := sanitizeSessionKey(sessionKey)
- 	rec := httptest.NewRecorder()
--	req := httptest.NewRequest(http.MethodGet, "/api/sessions/legacy-json", nil)
-+	req := httptest.NewRequest(http.MethodGet, "/api/sessions/"+sanitizedID, nil)
- 	mux.ServeHTTP(rec, req)
- 
- 	if rec.Code != http.StatusOK {
-@@ -642,7 +655,7 @@ func TestHandleSessions_FiltersEmptyJSONLFiles(t *testing.T) {
- 	defer cleanup()
- 
- 	dir := sessionsTestDir(t, configPath)
--	base := filepath.Join(dir, sanitizeSessionKey(picoSessionPrefix+"empty-jsonl"))
-+	base := filepath.Join(dir, sanitizeSessionKey(testPicoSessionPrefix+"empty-jsonl"))
- 	if err := os.WriteFile(base+".jsonl", []byte{}, 0o644); err != nil {
- 		t.Fatalf("WriteFile(jsonl) error = %v", err)
- 	}
-@@ -667,11 +680,408 @@ func TestHandleSessions_FiltersEmptyJSONLFiles(t *testing.T) {
+@@ -1044,3 +1047,376 @@ func TestHandleSessions_IgnoresMetaJSONInLegacyFallback(t *testing.T) {
  		t.Fatalf("len(items) = %d, want 0", len(items))
- 	}
- 
-+	sanitizedID := sanitizeSessionKey(testPicoSessionPrefix + "empty-jsonl")
- 	detailRec := httptest.NewRecorder()
--	detailReq := httptest.NewRequest(http.MethodGet, "/api/sessions/empty-jsonl", nil)
-+	detailReq := httptest.NewRequest(http.MethodGet, "/api/sessions/"+sanitizedID, nil)
- 	mux.ServeHTTP(detailRec, detailReq)
- 
- 	if detailRec.Code != http.StatusNotFound {
- 		t.Fatalf("detail status = %d, want %d, body=%s", detailRec.Code, http.StatusNotFound, detailRec.Body.String())
  	}
  }
 +
@@ -562,6 +328,9 @@ index 9248c11..a556e16 100644
 +	}); err != nil {
 +		t.Fatalf("AddFullMessage(assistant) error = %v", err)
 +	}
++	if err := store.SetSummary(nil, sessionKey, "Discord session"); err != nil {
++		t.Fatalf("SetSummary() error = %v", err)
++	}
 +
 +	h := NewHandler(configPath)
 +	mux := http.NewServeMux()
@@ -582,7 +351,7 @@ index 9248c11..a556e16 100644
 +	if len(items) != 1 {
 +		t.Fatalf("len(items) = %d, want 1", len(items))
 +	}
-+	wantID := "agent_main_discord_direct_123456789"
++	wantID := sanitizeSessionKey(sessionKey)
 +	if items[0].ID != wantID {
 +		t.Fatalf("items[0].ID = %q, want %q", items[0].ID, wantID)
 +	}
@@ -616,6 +385,9 @@ index 9248c11..a556e16 100644
 +		Content: "Response in Discord channel",
 +	}); err != nil {
 +		t.Fatalf("AddFullMessage(assistant) error = %v", err)
++	}
++	if err := store.SetSummary(nil, sessionKey, "Discord channel session"); err != nil {
++		t.Fatalf("SetSummary() error = %v", err)
 +	}
 +
 +	h := NewHandler(configPath)
@@ -659,12 +431,15 @@ index 9248c11..a556e16 100644
 +		t.Fatalf("NewJSONLStore() error = %v", err)
 +	}
 +
-+	picoKey := testPicoSessionPrefix + "mixed-pico"
++	picoKey := legacyPicoSessionPrefix + "mixed-pico"
 +	if err := store.AddFullMessage(nil, picoKey, providers.Message{
 +		Role:    "user",
 +		Content: "Pico session message",
 +	}); err != nil {
 +		t.Fatalf("AddFullMessage(pico) error = %v", err)
++	}
++	if err := store.SetSummary(nil, picoKey, "Pico session"); err != nil {
++		t.Fatalf("SetSummary(pico) error = %v", err)
 +	}
 +
 +	discordKey := "agent:main:discord:direct:555555"
@@ -673,6 +448,9 @@ index 9248c11..a556e16 100644
 +		Content: "Discord session message",
 +	}); err != nil {
 +		t.Fatalf("AddFullMessage(discord) error = %v", err)
++	}
++	if err := store.SetSummary(nil, discordKey, "Discord session"); err != nil {
++		t.Fatalf("SetSummary(discord) error = %v", err)
 +	}
 +
 +	h := NewHandler(configPath)
@@ -694,7 +472,6 @@ index 9248c11..a556e16 100644
 +	if len(items) != 2 {
 +		t.Fatalf("len(items) = %d, want 2", len(items))
 +	}
-+
 +	channels := map[string]bool{}
 +	for _, item := range items {
 +		channels[item.Channel] = true
@@ -730,6 +507,9 @@ index 9248c11..a556e16 100644
 +	}); err != nil {
 +		t.Fatalf("AddFullMessage(assistant) error = %v", err)
 +	}
++	if err := store.SetSummary(nil, sessionKey, "WhatsApp session"); err != nil {
++		t.Fatalf("SetSummary() error = %v", err)
++	}
 +
 +	h := NewHandler(configPath)
 +	mux := http.NewServeMux()
@@ -758,34 +538,6 @@ index 9248c11..a556e16 100644
 +	}
 +}
 +
-+func TestIsSessionKey(t *testing.T) {
-+	tests := []struct {
-+		key    string
-+		wantID string
-+		wantOK bool
-+	}{
-+		{"agent:main:discord:direct:123", "agent_main_discord_direct_123", true},
-+		{"agent:main:whatsapp_native:direct:456", "agent_main_whatsapp_native_direct_456", true},
-+		{"agent:main:pico:direct:pico:abc", "agent_main_pico_direct_pico_abc", true},
-+		{"agent_main_discord_direct_123", "agent_main_discord_direct_123", true},
-+		{"agent_main_whatsapp_native_direct_456", "agent_main_whatsapp_native_direct_456", true},
-+		{"agent:main:", "", false},
-+		{"agent_main_", "", false},
-+		{"unrelated-file", "", false},
-+		{"", "", false},
-+	}
-+
-+	for _, tt := range tests {
-+		sanitizedID, ok := isSessionKey(tt.key)
-+		if ok != tt.wantOK {
-+			t.Errorf("isSessionKey(%q) ok = %v, want %v", tt.key, ok, tt.wantOK)
-+		}
-+		if sanitizedID != tt.wantID {
-+			t.Errorf("isSessionKey(%q) = %q, want %q", tt.key, sanitizedID, tt.wantID)
-+		}
-+	}
-+}
-+
 +func TestChannelFromSessionKey(t *testing.T) {
 +	tests := []struct {
 +		key  string
@@ -795,7 +547,6 @@ index 9248c11..a556e16 100644
 +		{"agent:main:whatsapp_native:direct:456", "whatsapp_native"},
 +		{"agent:main:pico:direct:pico:abc", "pico"},
 +		{"agent:main:telegram:channel:789", "telegram"},
-+		{"agent:main:pico_client:direct:xyz", "pico_client"},
 +		{"agent_main_discord_direct_123", "discord"},
 +		{"agent_main_pico_direct_pico_abc", "pico"},
 +		{"agent_main_", ""},
@@ -808,6 +559,33 @@ index 9248c11..a556e16 100644
 +		got := channelFromSessionKey(tt.key)
 +		if got != tt.want {
 +			t.Errorf("channelFromSessionKey(%q) = %q, want %q", tt.key, got, tt.want)
++		}
++	}
++}
++
++func TestIsValidSessionID(t *testing.T) {
++	tests := []struct {
++		id   string
++		want bool
++	}{
++		{"agent_main_discord_direct_123", true},
++		{"history-jsonl", true},
++		{"scope-jsonl", true},
++		{"", false},
++		{"..", false},
++		{".", false},
++		{"../secret", false},
++		{"/etc/passwd", false},
++		{"foo/../bar", false},
++		{"foo/bar", false},
++		{"foo\\bar", false},
++		{"foo%2Fbar", true},
++	}
++
++	for _, tt := range tests {
++		got := isValidSessionID(tt.id)
++		if got != tt.want {
++			t.Errorf("isValidSessionID(%q) = %v, want %v", tt.id, got, tt.want)
 +		}
 +	}
 +}
@@ -846,54 +624,19 @@ index 9248c11..a556e16 100644
 +	}
 +}
 +
-+func TestHandleGetSession_RejectsNonSessionKey(t *testing.T) {
-+	configPath, cleanup := setupOAuthTestEnv(t)
-+	defer cleanup()
-+
-+	h := NewHandler(configPath)
-+	mux := http.NewServeMux()
-+	h.RegisterRoutes(mux)
-+
-+	rec := httptest.NewRecorder()
-+	req := httptest.NewRequest(http.MethodGet, "/api/sessions/not_a_session", nil)
-+	mux.ServeHTTP(rec, req)
-+
-+	if rec.Code != http.StatusBadRequest {
-+		t.Fatalf("status = %d, want %d for non-session key", rec.Code, http.StatusBadRequest)
-+	}
-+}
-+
-+func TestHandleDeleteSession_RejectsNonSessionKey(t *testing.T) {
-+	configPath, cleanup := setupOAuthTestEnv(t)
-+	defer cleanup()
-+
-+	h := NewHandler(configPath)
-+	mux := http.NewServeMux()
-+	h.RegisterRoutes(mux)
-+
-+	rec := httptest.NewRecorder()
-+	req := httptest.NewRequest(http.MethodDelete, "/api/sessions/random_file", nil)
-+	mux.ServeHTTP(rec, req)
-+
-+	if rec.Code != http.StatusBadRequest {
-+		t.Fatalf("status = %d, want %d for non-session key", rec.Code, http.StatusBadRequest)
-+	}
-+}
-+
 +func TestHandleGetSession_FallsBackToLegacyOnCorruptJSONL(t *testing.T) {
 +	configPath, cleanup := setupOAuthTestEnv(t)
 +	defer cleanup()
 +
 +	dir := sessionsTestDir(t, configPath)
++	sessionKey := legacyPicoSessionPrefix + "corrupt-fallback"
++	sanitizedKey := sanitizeSessionKey(sessionKey)
 +
-+	sessionKey := testPicoSessionPrefix + "corrupt-fallback"
-+	sanitizedID := sanitizeSessionKey(sessionKey)
-+
-+	corruptJSONL := filepath.Join(dir, sanitizedID+".jsonl")
++	corruptJSONL := filepath.Join(dir, sanitizedKey+".jsonl")
 +	if err := os.WriteFile(corruptJSONL, []byte("not valid json\n"), 0o644); err != nil {
 +		t.Fatalf("WriteFile(corrupt jsonl) error = %v", err)
 +	}
-+	corruptMeta := filepath.Join(dir, sanitizedID+".meta.json")
++	corruptMeta := filepath.Join(dir, sanitizedKey+".meta.json")
 +	if err := os.WriteFile(corruptMeta, []byte("{invalid json"), 0o644); err != nil {
 +		t.Fatalf("WriteFile(corrupt meta) error = %v", err)
 +	}
@@ -910,7 +653,7 @@ index 9248c11..a556e16 100644
 +	h.RegisterRoutes(mux)
 +
 +	rec := httptest.NewRecorder()
-+	req := httptest.NewRequest(http.MethodGet, "/api/sessions/"+sanitizedID, nil)
++	req := httptest.NewRequest(http.MethodGet, "/api/sessions/corrupt-fallback", nil)
 +	mux.ServeHTTP(rec, req)
 +
 +	if rec.Code != http.StatusOK {
@@ -947,7 +690,7 @@ index dd0fa1f..ae4deed 100644
    preview: string
    message_count: number
 diff --git a/web/frontend/src/components/chat/session-history-menu.tsx b/web/frontend/src/components/chat/session-history-menu.tsx
-index 3ec1a5e..9477bcc 100644
+index 3ec1a5e..6f0c6b3 100644
 --- a/web/frontend/src/components/chat/session-history-menu.tsx
 +++ b/web/frontend/src/components/chat/session-history-menu.tsx
 @@ -1,4 +1,4 @@
@@ -964,7 +707,7 @@ index 3ec1a5e..9477bcc 100644
  
  interface SessionHistoryMenuProps {
    sessions: SessionSummary[]
-@@ -62,24 +63,32 @@ export function SessionHistoryMenu({
+@@ -62,38 +63,47 @@ export function SessionHistoryMenu({
                </span>
              </DropdownMenuItem>
            ) : (
@@ -986,6 +729,15 @@ index 3ec1a5e..9477bcc 100644
 -                  · {dayjs(session.updated).fromNow()}
 -                </span>
 -                <Button
+-                  variant="ghost"
+-                  size="icon"
+-                  aria-label={t("chat.deleteSession")}
+-                  className="text-muted-foreground hover:bg-destructive/10 hover:text-destructive absolute top-1/2 right-2 h-6 w-6 -translate-y-1/2 opacity-0 transition-opacity group-hover:opacity-100"
+-                  onClick={(e) => {
+-                    e.preventDefault()
+-                    e.stopPropagation()
+-                    onDeleteSession(session.id)
+-                  }}
 +            sessions.map((session) => {
 +              const ChannelIcon = CHANNEL_ICON_MAP[session.channel] ?? IconPlug
 +              return (
@@ -1000,7 +752,11 @@ index 3ec1a5e..9477bcc 100644
 +                      : ""
 +                  }`}
 +                  onClick={() => onSwitchSession(session.id)}
-+                >
+                 >
+-                  <IconTrash className="h-4 w-4" />
+-                </Button>
+-              </DropdownMenuItem>
+-            ))
 +                  <span className="flex items-center gap-2 line-clamp-1 text-sm font-medium w-full">
 +                    <ChannelIcon className="size-4 shrink-0 text-muted-foreground" />
 +                    <span className="truncate">{session.title}</span>
@@ -1012,32 +768,33 @@ index 3ec1a5e..9477bcc 100644
 +                    · {dayjs(session.updated).fromNow()}
 +                  </span>
 +                  <Button
-                   variant="ghost"
-                   size="icon"
-                   aria-label={t("chat.deleteSession")}
-@@ -93,8 +102,8 @@ export function SessionHistoryMenu({
-                   <IconTrash className="h-4 w-4" />
-                 </Button>
-               </DropdownMenuItem>
--            ))
--          )}
-+            )
-+          })}
++                    variant="ghost"
++                    size="icon"
++                    aria-label={t("chat.deleteSession")}
++                    className="text-muted-foreground hover:bg-destructive/10 hover:text-destructive absolute top-1/2 right-2 h-6 w-6 -translate-y-1/2 opacity-0 transition-opacity group-hover:opacity-100"
++                    onClick={(e) => {
++                      e.preventDefault()
++                      e.stopPropagation()
++                      onDeleteSession(session.id)
++                    }}
++                  >
++                    <IconTrash className="h-4 w-4" />
++                  </Button>
++                </DropdownMenuItem>
++              )
++            })
+           )}
            {hasMore && sessions.length > 0 && (
              <div ref={observerRef} className="py-2 text-center">
-               <span className="text-muted-foreground animate-pulse text-xs">
 diff --git a/web/frontend/src/features/chat/controller.ts b/web/frontend/src/features/chat/controller.ts
-index c5c93d2..d94e3a2 100644
+index 4891944..a529b3b 100644
 --- a/web/frontend/src/features/chat/controller.ts
 +++ b/web/frontend/src/features/chat/controller.ts
-@@ -407,7 +407,17 @@ export async function switchChatSession(sessionId: string) {
-       hasHydratedActiveSession: true,
+@@ -395,9 +395,14 @@ export async function switchChatSession(sessionId: string) {
+       contextUsage: undefined,
      })
  
 -    if (store.get(gatewayAtom).status === "running") {
-+    // Only reconnect WebSocket for Pico sessions. Non-Pico sessions
-+    // (e.g. Discord, Telegram) are read-only history views — the Pico
-+    // WebSocket endpoint cannot handle their session IDs.
 +    const isPicoSession =
 +      sessionId.startsWith("agent_main_pico_") ||
 +      !sessionId.startsWith("agent_main_")
@@ -1045,10 +802,10 @@ index c5c93d2..d94e3a2 100644
        shouldMaintainConnection = true
        await connectChat()
 +    } else {
-+      // Prevent stale reconnection attempts after viewing non-Pico
-+      // session history (e.g. on page reload or gateway restart).
 +      shouldMaintainConnection = false
      }
+   } catch (error) {
+     console.error("Failed to load session history:", error)
 diff --git a/web/frontend/src/hooks/use-sidebar-channels.ts b/web/frontend/src/hooks/use-sidebar-channels.ts
 index 22fc24e..9b1f1d4 100644
 --- a/web/frontend/src/hooks/use-sidebar-channels.ts

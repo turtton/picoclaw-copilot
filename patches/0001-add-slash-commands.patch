@@ -1,8 +1,8 @@
 diff --git a/pkg/bus/types.go b/pkg/bus/types.go
-index 27cf61b..2195c3a 100644
+index 953e69d..20e3f87 100644
 --- a/pkg/bus/types.go
 +++ b/pkg/bus/types.go
-@@ -8,11 +8,12 @@ type Peer struct {
+@@ -2,11 +2,12 @@ package bus
  
  // SenderInfo provides structured sender identity information.
  type SenderInfo struct {
@@ -19,15 +19,15 @@ index 27cf61b..2195c3a 100644
 +	PreAuthorized bool   `json:"-"`                      // transient: skip allow-list re-check (set by channel-level role auth)
  }
  
- type InboundMessage struct {
+ // InboundContext captures the normalized, platform-agnostic facts about an
 diff --git a/pkg/channels/base.go b/pkg/channels/base.go
-index bd4ced8..f94143f 100644
+index 3585fb0..50cad82 100644
 --- a/pkg/channels/base.go
 +++ b/pkg/channels/base.go
-@@ -257,13 +257,15 @@ func (c *BaseChannel) HandleMessage(
- 	if len(senderOpts) > 0 {
+@@ -273,13 +273,15 @@ func (c *BaseChannel) HandleMessageWithContext(
  		sender = senderOpts[0]
  	}
+ 	senderID := strings.TrimSpace(inboundCtx.SenderID)
 -	if sender.CanonicalID != "" || sender.PlatformID != "" {
 -		if !c.IsAllowedSender(sender) {
 -			return
@@ -48,10 +48,10 @@ index bd4ced8..f94143f 100644
  	}
  
 diff --git a/pkg/channels/discord/discord.go b/pkg/channels/discord/discord.go
-index 01b1b40..cccc751 100644
+index 28f7277..223a01b 100644
 --- a/pkg/channels/discord/discord.go
 +++ b/pkg/channels/discord/discord.go
-@@ -103,6 +103,7 @@ func (c *DiscordChannel) Start(ctx context.Context) error {
+@@ -109,6 +109,7 @@ func (c *DiscordChannel) Start(ctx context.Context) error {
  	c.botUserID = botUser.ID
  
  	c.session.AddHandler(c.handleMessage)
@@ -59,7 +59,7 @@ index 01b1b40..cccc751 100644
  
  	go c.listenVoiceControl(c.ctx)
  
-@@ -110,6 +111,73 @@ func (c *DiscordChannel) Start(ctx context.Context) error {
+@@ -116,6 +117,73 @@ func (c *DiscordChannel) Start(ctx context.Context) error {
  		return fmt.Errorf("failed to open discord session: %w", err)
  	}
  
@@ -133,7 +133,7 @@ index 01b1b40..cccc751 100644
  	c.SetRunning(true)
  
  	logger.InfoCF("discord", "Discord bot connected", map[string]any{
-@@ -388,10 +456,14 @@ func (c *DiscordChannel) handleMessage(s *discordgo.Session, m *discordgo.Messag
+@@ -394,10 +462,14 @@ func (c *DiscordChannel) handleMessage(s *discordgo.Session, m *discordgo.Messag
  	sender.DisplayName = displayName
  
  	if !c.IsAllowedSender(sender) {
@@ -152,8 +152,8 @@ index 01b1b40..cccc751 100644
  	}
  
  	if c.handleVoiceCommand(s, m) {
-@@ -520,6 +592,149 @@ func (c *DiscordChannel) handleMessage(s *discordgo.Session, m *discordgo.Messag
- 	c.HandleMessage(c.ctx, peer, m.ID, senderID, m.ChannelID, content, mediaPaths, metadata, sender)
+@@ -538,6 +610,158 @@ func (c *DiscordChannel) handleMessage(s *discordgo.Session, m *discordgo.Messag
+ 	c.HandleInboundContext(c.ctx, m.ChannelID, content, mediaPaths, inboundCtx, sender)
  }
  
 +func (c *DiscordChannel) handleInteraction(s *discordgo.Session, i *discordgo.InteractionCreate) {
@@ -201,13 +201,9 @@ index 01b1b40..cccc751 100644
 +	senderID := user.ID
 +
 +	peerKind := "channel"
-+	peerID := channelID
 +	if i.GuildID == "" {
 +		peerKind = "direct"
-+		peerID = senderID
 +	}
-+
-+	peer := bus.Peer{Kind: peerKind, ID: peerID}
 +
 +	metadata := map[string]string{
 +		"user_id":        senderID,
@@ -256,7 +252,20 @@ index 01b1b40..cccc751 100644
 +		return
 +	}
 +
-+	c.HandleMessage(c.ctx, peer, "", senderID, channelID, textCommand, nil, metadata, sender)
++	inboundCtx := bus.InboundContext{
++		Channel:   c.Name(),
++		ChatID:    channelID,
++		ChatType:  peerKind,
++		SenderID:  senderID,
++		Mentioned: true,
++		Raw:       metadata,
++	}
++	if i.GuildID != "" {
++		inboundCtx.SpaceID = i.GuildID
++		inboundCtx.SpaceType = "guild"
++	}
++
++	c.HandleInboundContext(c.ctx, channelID, textCommand, nil, inboundCtx, sender)
 +}
 +
 +func (c *DiscordChannel) isAllowedByRole(guildID, userID string, member *discordgo.Member) bool {
@@ -264,7 +273,7 @@ index 01b1b40..cccc751 100644
 +		return false
 +	}
 +
-+	allowList := c.config.AllowFrom
++	allowList := c.bc.AllowFrom
 +	if len(allowList) == 0 {
 +		return false
 +	}

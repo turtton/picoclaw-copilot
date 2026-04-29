@@ -1,7 +1,7 @@
-diff --git a/pkg/providers/github_copilot_provider.go b/pkg/providers/github_copilot_provider.go
-index 472c142..ab24e6f 100644
---- a/pkg/providers/github_copilot_provider.go
-+++ b/pkg/providers/github_copilot_provider.go
+diff --git a/pkg/providers/cli/github_copilot_provider.go b/pkg/providers/cli/github_copilot_provider.go
+index d1d8a3e..04f4a3b 100644
+--- a/pkg/providers/cli/github_copilot_provider.go
++++ b/pkg/providers/cli/github_copilot_provider.go
 @@ -4,6 +4,7 @@ import (
  	"context"
  	"encoding/json"

@@ -1,8 +1,8 @@
-diff --git a/pkg/agent/loop.go b/pkg/agent/loop.go
-index 11446d2..9058510 100644
---- a/pkg/agent/loop.go
-+++ b/pkg/agent/loop.go
-@@ -437,6 +437,21 @@ func registerSharedTools(
+diff --git a/pkg/agent/agent_init.go b/pkg/agent/agent_init.go
+index d7bfc22..9469530 100644
+--- a/pkg/agent/agent_init.go
++++ b/pkg/agent/agent_init.go
+@@ -350,5 +350,20 @@ func registerSharedTools(
  		} else if (spawnEnabled || spawnStatusEnabled) && !cfg.Tools.IsToolEnabled("subagent") {
  			logger.WarnCF("agent", "spawn/spawn_status tools require subagent to be enabled", nil)
  		}
@@ -23,12 +23,11 @@ index 11446d2..9058510 100644
 +		}
  	}
  }
- 
 diff --git a/pkg/config/config.go b/pkg/config/config.go
-index fd4466b..dd3fa16 100644
+index 5bc96fb..1c74e40 100644
 --- a/pkg/config/config.go
 +++ b/pkg/config/config.go
-@@ -700,6 +700,13 @@ type ToolConfig struct {
+@@ -609,6 +609,13 @@ type ToolConfig struct {
  	Enabled bool `json:"enabled" yaml:"-" env:"ENABLED"`
  }
  
@@ -42,7 +41,7 @@ index fd4466b..dd3fa16 100644
  type BraveConfig struct {
  	Enabled    bool          `json:"enabled"           yaml:"-"                  env:"PICOCLAW_TOOLS_WEB_BRAVE_ENABLED"`
  	APIKeys    SecureStrings `json:"api_keys,omitzero" yaml:"api_keys,omitempty" env:"PICOCLAW_TOOLS_WEB_BRAVE_API_KEYS"`
-@@ -903,6 +910,7 @@ type ToolsConfig struct {
+@@ -820,6 +827,7 @@ type ToolsConfig struct {
  	SpawnStatus     ToolConfig         `json:"spawn_status"      yaml:"-"                                                       envPrefix:"PICOCLAW_TOOLS_SPAWN_STATUS_"`
  	SPI             ToolConfig         `json:"spi"               yaml:"-"                                                       envPrefix:"PICOCLAW_TOOLS_SPI_"`
  	Subagent        ToolConfig         `json:"subagent"          yaml:"-"                                                       envPrefix:"PICOCLAW_TOOLS_SUBAGENT_"`
@@ -50,7 +49,7 @@ index fd4466b..dd3fa16 100644
  	WebFetch        ToolConfig         `json:"web_fetch"         yaml:"-"                                                       envPrefix:"PICOCLAW_TOOLS_WEB_FETCH_"`
  	WriteFile       ToolConfig         `json:"write_file"        yaml:"-"                                                       envPrefix:"PICOCLAW_TOOLS_WRITE_FILE_"`
  }
-@@ -1384,6 +1392,8 @@ func (t *ToolsConfig) IsToolEnabled(name string) bool {
+@@ -1499,6 +1507,8 @@ func (t *ToolsConfig) IsToolEnabled(name string) bool {
  		return t.SPI.Enabled
  	case "subagent":
  		return t.Subagent.Enabled
@@ -61,10 +60,10 @@ index fd4466b..dd3fa16 100644
  	case "send_file":
 diff --git a/pkg/tools/opencode_task.go b/pkg/tools/opencode_task.go
 new file mode 100644
-index 0000000..40ada4b
+index 0000000..56662c6
 --- /dev/null
 +++ b/pkg/tools/opencode_task.go
-@@ -0,0 +1,647 @@
+@@ -0,0 +1,648 @@
 +package tools
 +
 +import (
@@ -79,6 +78,7 @@ index 0000000..40ada4b
 +	"strings"
 +	"time"
 +
++	"github.com/sipeed/picoclaw/pkg/agent/interfaces"
 +	"github.com/sipeed/picoclaw/pkg/bus"
 +	"github.com/sipeed/picoclaw/pkg/logger"
 +)
@@ -92,10 +92,10 @@ index 0000000..40ada4b
 +	password  string
 +	client    *http.Client
 +	sseClient *http.Client
-+	msgBus    *bus.MessageBus
++	msgBus    interfaces.MessageBus
 +}
 +
-+func NewOpenCodeTaskTool(serverURL, username, password string, msgBus *bus.MessageBus) *OpenCodeTaskTool {
++func NewOpenCodeTaskTool(serverURL, username, password string, msgBus interfaces.MessageBus) *OpenCodeTaskTool {
 +	serverURL = strings.TrimRight(serverURL, "/")
 +
 +	if (username == "") != (password == "") {
