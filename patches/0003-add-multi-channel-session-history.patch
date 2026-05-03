@@ -1,8 +1,8 @@
 diff --git a/web/backend/api/session.go b/web/backend/api/session.go
-index 0143f57..3092cfe 100644
+index cc18ee6..00fa5a9 100644
 --- a/web/backend/api/session.go
 +++ b/web/backend/api/session.go
-@@ -38,6 +38,7 @@ type sessionFile struct {
+@@ -39,6 +39,7 @@ type sessionFile struct {
  // sessionListItem is a lightweight summary returned by GET /api/sessions.
  type sessionListItem struct {
  	ID           string `json:"id"`
@@ -10,7 +10,7 @@ index 0143f57..3092cfe 100644
  	Title        string `json:"title"`
  	Preview      string `json:"preview"`
  	MessageCount int    `json:"message_count"`
-@@ -86,6 +87,46 @@ func sanitizeSessionKey(key string) string {
+@@ -97,6 +98,46 @@ func sanitizeSessionKey(key string) string {
  	return key
  }
  
@@ -57,7 +57,7 @@ index 0143f57..3092cfe 100644
  func (h *Handler) readLegacySession(path string) (sessionFile, error) {
  	data, err := os.ReadFile(path)
  	if err != nil {
-@@ -200,6 +241,12 @@ type picoLegacySessionRef struct {
+@@ -214,6 +255,12 @@ type picoLegacySessionRef struct {
  	Path string
  }
  
@@ -70,7 +70,7 @@ index 0143f57..3092cfe 100644
  func extractPicoSessionIDFromScope(scope session.SessionScope) (string, bool) {
  	if !strings.EqualFold(strings.TrimSpace(scope.Channel), "pico") {
  		return "", false
-@@ -397,7 +444,100 @@ func (h *Handler) findLegacyPicoSession(dir, sessionID string) (picoLegacySessio
+@@ -411,7 +458,100 @@ func (h *Handler) findLegacyPicoSession(dir, sessionID string) (picoLegacySessio
  	return picoLegacySessionRef{}, os.ErrNotExist
  }
  
@@ -169,18 +169,18 @@ index 0143f57..3092cfe 100644
 +}
 +
 +func buildSessionListItem(sessionID string, channel string, sess sessionFile, toolFeedbackMaxArgsLength int) sessionListItem {
+ 	transcript := visibleSessionMessages(sess.Messages, toolFeedbackMaxArgsLength)
+ 
  	preview := ""
- 	for _, msg := range sess.Messages {
- 		if msg.Role == "user" {
-@@ -418,6 +558,7 @@ func buildSessionListItem(sessionID string, sess sessionFile, toolFeedbackMaxArg
+@@ -432,6 +572,7 @@ func buildSessionListItem(sessionID string, sess sessionFile, toolFeedbackMaxArg
  
  	return sessionListItem{
  		ID:           sessionID,
 +		Channel:      channel,
  		Title:        title,
  		Preview:      preview,
- 		MessageCount: validMessageCount,
-@@ -689,7 +830,7 @@ func (h *Handler) handleListSessions(w http.ResponseWriter, r *http.Request) {
+ 		MessageCount: len(transcript),
+@@ -821,7 +962,7 @@ func (h *Handler) handleListSessions(w http.ResponseWriter, r *http.Request) {
  				continue
  			}
  			seen[ref.ID] = struct{}{}
@@ -189,7 +189,7 @@ index 0143f57..3092cfe 100644
  		}
  	}
  
-@@ -703,7 +844,21 @@ func (h *Handler) handleListSessions(w http.ResponseWriter, r *http.Request) {
+@@ -835,7 +976,21 @@ func (h *Handler) handleListSessions(w http.ResponseWriter, r *http.Request) {
  				continue
  			}
  			seen[ref.ID] = struct{}{}
@@ -212,7 +212,7 @@ index 0143f57..3092cfe 100644
  		}
  	}
  
-@@ -751,6 +906,10 @@ func (h *Handler) handleGetSession(w http.ResponseWriter, r *http.Request) {
+@@ -883,6 +1038,10 @@ func (h *Handler) handleGetSession(w http.ResponseWriter, r *http.Request) {
  		http.Error(w, "missing session id", http.StatusBadRequest)
  		return
  	}
@@ -223,7 +223,7 @@ index 0143f57..3092cfe 100644
  
  	dir, toolFeedbackMaxArgsLength, err := h.sessionRuntimeSettings()
  	if err != nil {
-@@ -768,14 +927,24 @@ func (h *Handler) handleGetSession(w http.ResponseWriter, r *http.Request) {
+@@ -900,14 +1059,24 @@ func (h *Handler) handleGetSession(w http.ResponseWriter, r *http.Request) {
  		err = os.ErrNotExist
  	}
  	if err != nil {
@@ -252,7 +252,7 @@ index 0143f57..3092cfe 100644
  		if err != nil {
  			if errors.Is(err, os.ErrNotExist) {
  				http.Error(w, "session not found", http.StatusNotFound)
-@@ -807,6 +976,10 @@ func (h *Handler) handleDeleteSession(w http.ResponseWriter, r *http.Request) {
+@@ -939,6 +1108,10 @@ func (h *Handler) handleDeleteSession(w http.ResponseWriter, r *http.Request) {
  		http.Error(w, "missing session id", http.StatusBadRequest)
  		return
  	}
@@ -263,7 +263,7 @@ index 0143f57..3092cfe 100644
  
  	dir, err := h.sessionsDir()
  	if err != nil {
-@@ -840,6 +1013,22 @@ func (h *Handler) handleDeleteSession(w http.ResponseWriter, r *http.Request) {
+@@ -972,6 +1145,22 @@ func (h *Handler) handleDeleteSession(w http.ResponseWriter, r *http.Request) {
  		}
  	}
  
@@ -287,10 +287,10 @@ index 0143f57..3092cfe 100644
  		http.Error(w, "session not found", http.StatusNotFound)
  		return
 diff --git a/web/backend/api/session_test.go b/web/backend/api/session_test.go
-index f6c643b..0a5cbaf 100644
+index 760935d..bfd028f 100644
 --- a/web/backend/api/session_test.go
 +++ b/web/backend/api/session_test.go
-@@ -86,6 +86,9 @@ func TestHandleListSessions_JSONLStorage(t *testing.T) {
+@@ -106,6 +106,9 @@ func TestHandleListSessions_JSONLStorage(t *testing.T) {
  	if items[0].ID != "history-jsonl" {
  		t.Fatalf("items[0].ID = %q, want %q", items[0].ID, "history-jsonl")
  	}
@@ -300,7 +300,7 @@ index f6c643b..0a5cbaf 100644
  	if items[0].MessageCount != 2 {
  		t.Fatalf("items[0].MessageCount = %d, want 2", items[0].MessageCount)
  	}
-@@ -1044,3 +1047,376 @@ func TestHandleSessions_IgnoresMetaJSONInLegacyFallback(t *testing.T) {
+@@ -1749,3 +1752,376 @@ func TestHandleSessions_IgnoresMetaJSONInLegacyFallback(t *testing.T) {
  		t.Fatalf("len(items) = %d, want 0", len(items))
  	}
  }
@@ -678,7 +678,7 @@ index f6c643b..0a5cbaf 100644
 +	}
 +}
 diff --git a/web/frontend/src/api/sessions.ts b/web/frontend/src/api/sessions.ts
-index dd0fa1f..ae4deed 100644
+index edd7d7c..ec200c8 100644
 --- a/web/frontend/src/api/sessions.ts
 +++ b/web/frontend/src/api/sessions.ts
 @@ -2,6 +2,7 @@ import { launcherFetch } from "@/api/http"

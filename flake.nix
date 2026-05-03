@@ -24,13 +24,13 @@
 
           picoclaw = pkgs.buildGoModule rec {
             pname = "picoclaw";
-            version = "0.2.7";
+            version = "0.2.8";
 
             src = pkgs.fetchFromGitHub {
               owner = "sipeed";
               repo = "picoclaw";
               rev = "v${version}";
-              hash = "sha256-dANvn1uBq3iYlXiQUC+uj5H4BpNR4luyvpCqxLxYCmQ=";
+              hash = "sha256-PCPqdxXoXgJZduw3o5p6+heQ8wHxidcqGQBxqD3IdjQ=";
             };
 
             patches = [
@@ -41,7 +41,7 @@
               ./patches/0005-fix-copilot-session-resume.patch
             ];
 
-            vendorHash = "sha256-15CA78Yp4aubOT9pybfzBPIip4BxtsECnx/b+zwcZVc=";
+            vendorHash = "sha256-LVfn2PsgqRVF/mLN/TLAENDEo+MnFc4DVG13+6dU+V4=";
             proxyVendor = true;
 
             env.CGO_ENABLED = "0";
