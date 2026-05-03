@@ -9,16 +9,24 @@ concurrency:
   group: update-picoclaw
   cancel-in-progress: false
 
+permissions: {}
+
 jobs:
-  check-update:
+  check-and-open-pr:
     runs-on: ubuntu-latest
     permissions:
-      contents: write
-      actions: write
+      contents: read
+    env:
+      PR_BRANCH: auto/upstream-update
 
     steps:
       - name: Checkout repository
         uses: actions/checkout@v6
+        with:
+          ref: main
+          fetch-depth: 0
+          token: ${{ secrets.PAT_TOKEN }}
+          persist-credentials: true
 
       - name: Check for new release
         id: check
@@ -42,6 +50,11 @@ jobs:
           LATEST_VERSION="${LATEST_TAG#v}"
           CURRENT_VERSION=$(grep -oP 'version = "\K[^"]+' flake.nix)
 
+          if [ -z "$CURRENT_VERSION" ]; then
+            echo "::error::Failed to extract current version from flake.nix"
+            exit 1
+          fi
+
           echo "latest=$LATEST_VERSION" >> "$GITHUB_OUTPUT"
           echo "current=$CURRENT_VERSION" >> "$GITHUB_OUTPUT"
 
@@ -53,12 +66,37 @@ jobs:
             echo "Already up to date: v$CURRENT_VERSION"
           fi
 
-      - name: Install Nix
+      - name: Check for manual commits on existing PR branch
         if: steps.check.outputs.update_needed == 'true'
+        id: branch-check
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          if git ls-remote --exit-code --heads origin "$PR_BRANCH" >/dev/null 2>&1; then
+            git fetch origin "+refs/heads/${PR_BRANCH}:refs/remotes/origin/${PR_BRANCH}"
+            # Count commits on PR branch not in main, excluding automated ones.
+            MANUAL_COUNT=$(git log "origin/main..origin/${PR_BRANCH}" \
+              --grep='^chore: track upstream ' \
+              --grep='\[skip ai-review\]' \
+              --invert-grep \
+              --pretty=%H | grep -c . || true)
+            if [ "$MANUAL_COUNT" -gt 0 ]; then
+              echo "::warning::Found $MANUAL_COUNT manual commit(s) on $PR_BRANCH; skipping force-push to preserve them."
+              echo "skip=true" >> "$GITHUB_OUTPUT"
+            else
+              echo "skip=false" >> "$GITHUB_OUTPUT"
+            fi
+          else
+            echo "Branch $PR_BRANCH does not exist on origin; proceeding."
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Install Nix
+        if: steps.check.outputs.update_needed == 'true' && steps.branch-check.outputs.skip != 'true'
         uses: DeterminateSystems/nix-installer-action@v22
 
-      - name: Update version and hashes
-        if: steps.check.outputs.update_needed == 'true'
+      - name: Update version and source hash
+        if: steps.check.outputs.update_needed == 'true' && steps.branch-check.outputs.skip != 'true'
         env:
           NEW_VERSION: ${{ steps.check.outputs.latest }}
         run: |
@@ -67,45 +105,49 @@ jobs:
           # Update version
           sed -i "s/version = \".*\"/version = \"$NEW_VERSION\"/" flake.nix
 
-          # Update source hash
+          # Update source hash (does NOT require patches to apply)
           echo "Fetching source hash for v${NEW_VERSION}..."
           SRC_HASH=$(nix-prefetch-url --unpack "https://github.com/sipeed/picoclaw/archive/refs/tags/v${NEW_VERSION}.tar.gz")
           SRI_SRC_HASH=$(nix hash to-sri --type sha256 "$SRC_HASH")
           echo "Source hash: $SRI_SRC_HASH"
           sed -i "s|hash = \"sha256-[^\"]*\"|hash = \"$SRI_SRC_HASH\"|" flake.nix
 
-          # Update vendorHash by triggering a build with a dummy hash
-          echo "Determining vendorHash..."
-          sed -i 's|vendorHash = "sha256-[^"]*"|vendorHash = "sha256-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="|' flake.nix
-          BUILD_OUTPUT=$(nix build .#picoclaw 2>&1 || true)
-          VENDOR_HASH=$(echo "$BUILD_OUTPUT" | grep -oP 'got:\s+\Ksha256-[A-Za-z0-9+/=]+' || true)
-          if [ -n "$VENDOR_HASH" ]; then
-            echo "Vendor hash: $VENDOR_HASH"
-            sed -i "s|vendorHash = \"sha256-[^\"]*\"|vendorHash = \"$VENDOR_HASH\"|" flake.nix
-          else
-            echo "::error::Failed to determine vendorHash. Build output:"
-            echo "$BUILD_OUTPUT"
-            exit 1
-          fi
+          # Update .upstream-version
+          echo "$NEW_VERSION" > .upstream-version
 
-      - name: Verify build
-        if: steps.check.outputs.update_needed == 'true'
-        run: nix build .#picoclaw
-
-      - name: Update upstream version file
-        if: steps.check.outputs.update_needed == 'true'
+      - name: Create or update PR branch
+        if: steps.check.outputs.update_needed == 'true' && steps.branch-check.outputs.skip != 'true'
         env:
           NEW_VERSION: ${{ steps.check.outputs.latest }}
-        run: echo "$NEW_VERSION" > .upstream-version
-
-      - name: Commit and push
-        if: steps.check.outputs.update_needed == 'true'
-        env:
-          NEW_VERSION: ${{ steps.check.outputs.latest }}
+          GH_TOKEN: ${{ secrets.PAT_TOKEN }}
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add flake.nix flake.lock .upstream-version
-          git diff --staged --quiet && { echo "No changes to commit"; exit 0; }
-          git commit -m "chore: update picoclaw to v${NEW_VERSION}"
-          git push
+
+          if git diff --quiet .upstream-version flake.nix; then
+            echo "No changes detected. Nothing to do."
+            exit 0
+          fi
+
+          git checkout -B "$PR_BRANCH"
+          git add .upstream-version flake.nix
+          git commit -m "chore: track upstream v${NEW_VERSION}"
+          git push --force-with-lease origin "$PR_BRANCH"
+
+          # Create PR if one does not already exist
+          if gh pr view "$PR_BRANCH" --json state --jq '.state' 2>/dev/null | grep -q OPEN; then
+            echo "PR already open for $PR_BRANCH; force-push has updated it."
+            gh pr edit "$PR_BRANCH" \
+              --title "chore: track upstream v${NEW_VERSION}" \
+              --body "Automated upstream update to [\`v${NEW_VERSION}\`](https://github.com/sipeed/picoclaw/releases/tag/v${NEW_VERSION}).
+
+          The AI review workflow will attempt to build, fix patches if needed, and evaluate patch necessity."
+          else
+            gh pr create \
+              --base main \
+              --head "$PR_BRANCH" \
+              --title "chore: track upstream v${NEW_VERSION}" \
+              --body "Automated upstream update to [\`v${NEW_VERSION}\`](https://github.com/sipeed/picoclaw/releases/tag/v${NEW_VERSION}).
+
+          The AI review workflow will attempt to build, fix patches if needed, and evaluate patch necessity."
+          fi

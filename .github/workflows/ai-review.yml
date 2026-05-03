@@ -1,0 +1,411 @@
+name: AI Review
+
+on:
+  pull_request_target:
+    types: [opened, synchronize, reopened]
+    branches: [main]
+
+concurrency:
+  group: ai-review-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+permissions: {}
+
+jobs:
+  review:
+    if: >-
+      github.event.pull_request.head.ref == 'auto/upstream-update' &&
+      github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+    env:
+      MODEL: github-copilot/claude-opus-4
+      ALLOWED_PATHS: 'patches/ flake.nix flake.lock .upstream-version'
+      SKIP_MARKER: '[skip ai-review]'
+    steps:
+      - name: Checkout PR branch
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ github.event.pull_request.head.ref }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Skip if last commit was AI-generated
+        id: skip-check
+        env:
+          SKIP_MARKER: ${{ env.SKIP_MARKER }}
+        run: |
+          LAST_MSG=$(git log -1 --pretty=%B)
+          if echo "$LAST_MSG" | grep -qF "$SKIP_MARKER"; then
+            echo "Last commit carries skip marker; exiting cleanly."
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Install Nix
+        if: steps.skip-check.outputs.skip != 'true'
+        uses: DeterminateSystems/nix-installer-action@v22
+
+      - name: Setup Nix cache
+        if: steps.skip-check.outputs.skip != 'true'
+        uses: DeterminateSystems/magic-nix-cache-action@v13
+
+      - name: Attempt build and capture result
+        if: steps.skip-check.outputs.skip != 'true'
+        id: build
+        continue-on-error: true
+        run: |
+          set +e
+          exec > >(tee build.log) 2>&1
+
+          echo "=== Attempting nix build .#picoclaw ==="
+          nix build .#picoclaw
+          BUILD_EXIT=$?
+
+          if [ "$BUILD_EXIT" -eq 0 ]; then
+            echo "BUILD_STAGE=success" >> "$GITHUB_OUTPUT"
+            echo "BUILD_EXIT=0" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # Check if it's a vendorHash mismatch
+          if grep -q 'got:.*sha256-' build.log; then
+            echo "BUILD_STAGE=vendor-hash-mismatch" >> "$GITHUB_OUTPUT"
+          elif grep -q 'FAILED' build.log || grep -q 'does not apply' build.log; then
+            echo "BUILD_STAGE=patch-failure" >> "$GITHUB_OUTPUT"
+          else
+            echo "BUILD_STAGE=other-failure" >> "$GITHUB_OUTPUT"
+          fi
+          echo "BUILD_EXIT=$BUILD_EXIT" >> "$GITHUB_OUTPUT"
+
+      - name: Try vendorHash fix (mechanical)
+        if: steps.skip-check.outputs.skip != 'true' && steps.build.outputs.BUILD_STAGE == 'vendor-hash-mismatch'
+        id: vendor-fix
+        run: |
+          set -euo pipefail
+
+          VENDOR_HASH=$(grep -oP 'got:\s+\Ksha256-[A-Za-z0-9+/=]+' build.log | head -1 || true)
+          if [ -n "$VENDOR_HASH" ]; then
+            echo "Fixing vendorHash to: $VENDOR_HASH"
+            sed -i "s|vendorHash = \"sha256-[^\"]*\"|vendorHash = \"$VENDOR_HASH\"|" flake.nix
+            if nix build .#picoclaw; then
+              echo "fixed=true" >> "$GITHUB_OUTPUT"
+            else
+              echo "fixed=false" >> "$GITHUB_OUTPUT"
+            fi
+          else
+            echo "fixed=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Seed Copilot auth.json
+        if: steps.skip-check.outputs.skip != 'true'
+        env:
+          COPILOT_ACCESS_TOKEN: ${{ secrets.COPILOT_ACCESS_TOKEN }}
+          COPILOT_REFRESH_TOKEN: ${{ secrets.COPILOT_REFRESH_TOKEN }}
+        run: |
+          if [ -z "$COPILOT_ACCESS_TOKEN" ] || [ -z "$COPILOT_REFRESH_TOKEN" ]; then
+            echo "::warning::COPILOT_ACCESS_TOKEN / COPILOT_REFRESH_TOKEN not configured. Skipping AI review."
+            echo "NO_AI=true" >> "$GITHUB_ENV"
+            exit 0
+          fi
+          AUTH_DIR="$HOME/.local/share/opencode"
+          mkdir -p "$AUTH_DIR"
+          jq -n \
+            --arg access "$COPILOT_ACCESS_TOKEN" \
+            --arg refresh "$COPILOT_REFRESH_TOKEN" \
+            '{"github-copilot": {type: "oauth", access: $access, refresh: $refresh, expires: 0}}' \
+            > "$AUTH_DIR/auth.json"
+          chmod 600 "$AUTH_DIR/auth.json"
+
+      - name: Install opencode CLI
+        if: steps.skip-check.outputs.skip != 'true' && env.NO_AI != 'true'
+        run: |
+          curl -fsSL https://opencode.ai/install | bash
+          echo "$HOME/.opencode/bin" >> "$GITHUB_PATH"
+
+      - name: Run opencode AI review
+        if: steps.skip-check.outputs.skip != 'true' && env.NO_AI != 'true'
+        env:
+          BUILD_STAGE: ${{ steps.build.outputs.BUILD_STAGE }}
+          BUILD_EXIT: ${{ steps.build.outputs.BUILD_EXIT }}
+          VENDOR_FIXED: ${{ steps.vendor-fix.outputs.fixed }}
+          OPENCODE_MODEL: ${{ env.MODEL }}
+        run: |
+          # Determine if we need a fix or just evaluation
+          if [ "$BUILD_STAGE" = "success" ] || [ "$VENDOR_FIXED" = "true" ]; then
+            REVIEW_MODE="evaluate-only"
+          else
+            REVIEW_MODE="fix-and-evaluate"
+          fi
+
+          cat <<'PROMPT' > /tmp/review-prompt.md
+          You are reviewing an auto-update PR for the turtton/picoclaw-copilot soft-fork.
+
+          # Fork Context
+          This repository applies local patches in `patches/` onto upstream sipeed/picoclaw
+          via Nix `buildGoModule`. Patches are applied in lexicographic order during the Nix build.
+
+          ## Active patches and their intents:
+
+          - `patches/0001-add-slash-commands.patch`: Adds Discord slash command support with
+            role-based authorization. Adds `PreAuthorized` flag to `bus.SenderInfo`, wraps the
+            allow-list check in `base.go` with a PreAuthorized guard, adds `handleInteraction()`
+            and `isAllowedByRole()` to discord.go, and registers slash commands on bot startup.
+
+          - `patches/0002-add-opencode-tool.patch`: Adds an `opencode_task` tool that allows the
+            agent to delegate tasks to a local opencode CLI instance. Registers the tool in
+            `agent_init.go`'s `registerSharedTools()`, adds config in `config.go`, and adds the
+            full tool implementation in `pkg/tools/opencode_task.go`.
+
+          - `patches/0003-add-multi-channel-session-history.patch`: Extends session history to
+            support non-pico channels (Discord, etc.). Adds channel-based session discovery via
+            `.meta.json` scope parsing, path traversal protection, and a `Channel` field to the
+            session list API. Also adds channel icons to the frontend.
+
+          - `patches/0004-add-subagent-discord-visibility.patch`: Makes subagent/subturn activity
+            visible in Discord threads. Adds `ThreadCapable` interface to `interfaces.go`,
+            `OpenThread()`/`SendToThread()` to discord.go, and a `SubTurnNotifier` service that
+            listens to agent events and creates/updates Discord threads.
+
+          - `patches/0005-fix-copilot-session-resume.patch`: Fixes session resume for GitHub
+            Copilot provider. Adds `isSessionNotFoundError()` and `recreateSession()` to handle
+            stale session IDs, with retry logic in the `Chat()` method.
+
+          # Your Tasks
+
+          ## Task 1: Fix patches (if build failed)
+          If the build log shows failures, diagnose and fix the patch files so that:
+          - All patches apply cleanly to the new upstream version
+          - The build (`nix build .#picoclaw`) succeeds
+          - The original intent of each patch is preserved
+
+          After fixing patches, determine the correct vendorHash:
+          1. Set vendorHash to `"sha256-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="` in flake.nix
+          2. Run `nix build .#picoclaw 2>&1` and extract the correct hash from "got: sha256-..."
+          3. Update vendorHash in flake.nix with the correct value
+          4. Verify the final build succeeds
+
+          ## Task 2: Evaluate patch necessity (ALWAYS)
+          For EACH patch, check whether upstream has incorporated the same functionality:
+          1. Read the upstream source files that the patch modifies
+          2. Compare the patch's additions against what upstream now provides natively
+          3. If a patch's functionality is now upstream, REMOVE the patch file and update
+             the `patches` list in `flake.nix`
+
+          Report your findings in `/tmp/review-summary.md` with format:
+          ```
+          ## Patch Status
+          | Patch | Status | Notes |
+          |-------|--------|-------|
+          | 0001-... | still needed / partially upstream / fully upstream | explanation |
+          ```
+
+          # Build Result
+          - Stage: ${BUILD_STAGE}
+          - Exit code: ${BUILD_EXIT}
+          - Full log: see `build.log` in repo root (if present)
+
+          # Hard Constraints
+          - You may ONLY edit files matching: patches/, flake.nix, flake.lock, .upstream-version
+          - Do NOT create or edit files outside this set
+          - Do NOT edit upstream source directly (patches are applied during Nix build)
+          - If no changes are required, write "No changes needed." to /tmp/review-summary.md
+          - Keep the review summary under 2000 words
+          PROMPT
+
+          # Substitute env vars in prompt
+          sed -i "s/\${BUILD_STAGE}/$BUILD_STAGE/g" /tmp/review-prompt.md
+          sed -i "s/\${BUILD_EXIT}/$BUILD_EXIT/g" /tmp/review-prompt.md
+
+          opencode run \
+            --model "$OPENCODE_MODEL" \
+            --dangerously-skip-permissions \
+            -- "$(cat /tmp/review-prompt.md)" \
+            > /tmp/opencode-stdout.log 2>&1 || {
+              echo "::warning::opencode exited non-zero; continuing to publish log."
+            }
+          cat /tmp/opencode-stdout.log
+
+      - name: Determine vendorHash if needed
+        if: >-
+          steps.skip-check.outputs.skip != 'true' &&
+          steps.build.outputs.BUILD_STAGE != 'success' &&
+          steps.vendor-fix.outputs.fixed != 'true'
+        run: |
+          # After AI fixes, we may need to determine the correct vendorHash
+          if ! nix build .#picoclaw 2>/dev/null; then
+            echo "Build still failing after AI fix. Attempting vendorHash determination..."
+            # Save original flake.nix in case extraction fails
+            cp flake.nix flake.nix.bak
+            sed -i 's|vendorHash = "sha256-[^"]*"|vendorHash = "sha256-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="|' flake.nix
+            BUILD_OUTPUT=$(nix build .#picoclaw 2>&1 || true)
+            VENDOR_HASH=$(echo "$BUILD_OUTPUT" | grep -oP 'got:\s+\Ksha256-[A-Za-z0-9+/=]+' | head -1 || true)
+            if [ -n "$VENDOR_HASH" ]; then
+              echo "Updated vendorHash to: $VENDOR_HASH"
+              sed -i "s|vendorHash = \"sha256-[^\"]*\"|vendorHash = \"$VENDOR_HASH\"|" flake.nix
+              rm -f flake.nix.bak
+            else
+              echo "::warning::Failed to determine vendorHash. Reverting flake.nix."
+              mv flake.nix.bak flake.nix
+            fi
+          fi
+
+      - name: Final build verification
+        if: steps.skip-check.outputs.skip != 'true'
+        id: final-build
+        continue-on-error: true
+        run: nix build .#picoclaw
+
+      - name: Revert edits outside allowlist
+        if: steps.skip-check.outputs.skip != 'true'
+        id: filter
+        env:
+          ALLOWED_PATHS: ${{ env.ALLOWED_PATHS }}
+        run: |
+          set -euo pipefail
+
+          # Clean transient build outputs (repo-local only, /tmp is safe)
+          rm -rf result build.log || true
+
+          # Build allowlist prefix array
+          ALLOW=()
+          for p in $ALLOWED_PATHS; do
+            ALLOW+=("${p%/}")
+          done
+
+          is_allowed() {
+            local path="$1"
+            for prefix in "${ALLOW[@]}"; do
+              if [ "$path" = "$prefix" ]; then return 0; fi
+              case "$path" in "$prefix"/*) return 0 ;; esac
+            done
+            return 1
+          }
+
+          # Parse git status and revert disallowed changes
+          mapfile -d '' ENTRIES < <(git status --porcelain=v1 -z)
+
+          TRACKED_REVERT=()
+          UNTRACKED_REMOVE=()
+
+          i=0
+          while [ "$i" -lt "${#ENTRIES[@]}" ]; do
+            entry="${ENTRIES[$i]}"
+            i=$((i + 1))
+            xy="${entry:0:2}"
+            path="${entry:3}"
+
+            case "$xy" in
+              R?|?R|C?|?C)
+                old_path=""
+                if [ "$i" -lt "${#ENTRIES[@]}" ]; then
+                  old_path="${ENTRIES[$i]}"
+                  i=$((i + 1))
+                fi
+                if ! is_allowed "$path" || { [ -n "$old_path" ] && ! is_allowed "$old_path"; }; then
+                  TRACKED_REVERT+=("$path")
+                  [ -n "$old_path" ] && TRACKED_REVERT+=("$old_path")
+                fi
+                continue
+                ;;
+            esac
+
+            if [ "$xy" = "??" ]; then
+              if ! is_allowed "$path"; then
+                UNTRACKED_REMOVE+=("$path")
+              fi
+            else
+              if ! is_allowed "$path"; then
+                TRACKED_REVERT+=("$path")
+              fi
+            fi
+          done
+
+          if [ "${#TRACKED_REVERT[@]}" -gt 0 ]; then
+            echo "Restoring tracked files outside allowlist:"
+            printf '  %s\n' "${TRACKED_REVERT[@]}"
+            git restore --source=HEAD --staged --worktree -- "${TRACKED_REVERT[@]}"
+          fi
+
+          if [ "${#UNTRACKED_REMOVE[@]}" -gt 0 ]; then
+            echo "Removing untracked files outside allowlist:"
+            printf '  %s\n' "${UNTRACKED_REMOVE[@]}"
+            for path in "${UNTRACKED_REMOVE[@]}"; do
+              rm -rf -- "$path"
+            done
+          fi
+
+          if git diff --quiet && git diff --cached --quiet && [ -z "$(git ls-files --others --exclude-standard)" ]; then
+            echo "changes=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "changes=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Commit and push fixes
+        if: steps.skip-check.outputs.skip != 'true' && steps.filter.outputs.changes == 'true'
+        env:
+          SKIP_MARKER: ${{ env.SKIP_MARKER }}
+          HEAD_REF: ${{ github.event.pull_request.head.ref }}
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git commit -m "chore: ai-review auto-fix ${SKIP_MARKER}"
+          git push "https://x-access-token:${GH_TOKEN}@github.com/${REPO}.git" "HEAD:${HEAD_REF}"
+
+      - name: Post review comment
+        if: steps.skip-check.outputs.skip != 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          BUILD_STAGE: ${{ steps.build.outputs.BUILD_STAGE }}
+          BUILD_EXIT: ${{ steps.build.outputs.BUILD_EXIT }}
+          CHANGES: ${{ steps.filter.outputs.changes }}
+          FINAL_BUILD: ${{ steps.final-build.outcome }}
+          REPO: ${{ github.repository }}
+          MODEL: ${{ env.MODEL }}
+        run: |
+          STICKY_MARKER='<!-- ai-review:sticky -->'
+          {
+            echo "$STICKY_MARKER"
+            echo "## AI Review"
+            echo ""
+            echo "- Model: \`${MODEL}\`"
+            echo "- Initial build: \`${BUILD_STAGE}\` (exit \`${BUILD_EXIT}\`)"
+            echo "- Auto-fix applied: \`${CHANGES}\`"
+            echo "- Final build: \`${FINAL_BUILD}\`"
+            echo ""
+            echo "### Summary"
+            echo ""
+            if [ -f /tmp/review-summary.md ]; then
+              cat /tmp/review-summary.md
+            else
+              echo "_No summary produced. See workflow logs._"
+            fi
+          } > /tmp/pr-comment.md
+
+          # Find existing sticky comment
+          EXISTING_ID=$(gh api \
+            "repos/${REPO}/issues/${PR_NUMBER}/comments" \
+            --paginate \
+            --jq ".[] | select(.user.login == \"github-actions[bot]\") | select(.body | contains(\"${STICKY_MARKER}\")) | .id" \
+            | head -n1)
+
+          if [ -n "$EXISTING_ID" ]; then
+            echo "Updating sticky comment $EXISTING_ID"
+            gh api --method PATCH \
+              "repos/${REPO}/issues/comments/${EXISTING_ID}" \
+              -F body=@/tmp/pr-comment.md
+          else
+            echo "Creating new sticky comment"
+            gh pr comment "$PR_NUMBER" --body-file /tmp/pr-comment.md
+          fi
+
+      - name: Gate on final build result
+        if: steps.skip-check.outputs.skip != 'true' && steps.final-build.outcome == 'failure'
+        run: exit 1
