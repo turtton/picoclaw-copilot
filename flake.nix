@@ -84,6 +84,9 @@
                 pkgs.cacert
                 pkgs.bashInteractive
                 pkgs.coreutils
+                pkgs.curl
+                pkgs.jq
+                pkgs.openssl
                 pkgs.tzdata
                 pkgs.dockerTools.fakeNss
               ];
