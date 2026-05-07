@@ -95,7 +95,6 @@
                 pkgs.gawk
                 pkgs.ripgrep
                 pkgs.uv
-                pkgs.python3
               ];
             };
 
