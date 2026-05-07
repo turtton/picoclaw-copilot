@@ -89,6 +89,13 @@
                 pkgs.openssl
                 pkgs.tzdata
                 pkgs.dockerTools.fakeNss
+                # Additional utilities for better scripting support
+                pkgs.gnused
+                pkgs.gnugrep
+                pkgs.gawk
+                pkgs.ripgrep
+                pkgs.uv
+                pkgs.python3
               ];
             };
 
