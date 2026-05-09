@@ -63,7 +63,7 @@ new file mode 100644
 index 0000000..56662c6
 --- /dev/null
 +++ b/pkg/tools/opencode_task.go
-@@ -0,0 +1,648 @@
+@@ -0,0 +1,803 @@
 +package tools
 +
 +import (
@@ -458,6 +458,39 @@ index 0000000..56662c6
 +	} `json:"info"`
 +}
 +
++type messagePartProperties struct {
++	SessionID string `json:"sessionID,omitempty"`
++	Part      struct {
++		Type           string `json:"type"`
++		SessionID      string `json:"sessionID,omitempty"`
++		Text           string `json:"text,omitempty"`
++		ToolInvocation *struct {
++			ToolName string `json:"toolName"`
++			State    string `json:"state"`
++		} `json:"toolInvocation,omitempty"`
++	} `json:"part"`
++}
++
++type sessionStatusProperties struct {
++	SessionID string `json:"sessionID"`
++	Status    struct {
++		Type    string `json:"type"`
++		Attempt int    `json:"attempt,omitempty"`
++		Message string `json:"message,omitempty"`
++	} `json:"status"`
++}
++
++type todoItem struct {
++	Content  string `json:"content"`
++	Status   string `json:"status"`
++	Priority string `json:"priority"`
++}
++
++type todoUpdatedProperties struct {
++	SessionID string     `json:"sessionID"`
++	Todos     []todoItem `json:"todos"`
++}
++
 +func (t *OpenCodeTaskTool) listenSSE(ctx context.Context, sessionID, channel, chatID string, ready chan<- error, sseErr chan<- error, completionCh chan string) {
 +	req, err := http.NewRequestWithContext(ctx, http.MethodGet, t.serverURL+"/event", nil)
 +	if err != nil {
@@ -496,6 +529,7 @@ index 0000000..56662c6
 +	scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
 +
 +	var dataLines []string
++	var lastFeedback time.Time
 +	completionSeen := false
 +	for scanner.Scan() {
 +		if ctx.Err() != nil {
@@ -516,7 +550,7 @@ index 0000000..56662c6
 +		if line == "" && len(dataLines) > 0 {
 +			data := strings.Join(dataLines, "\n")
 +			dataLines = nil
-+			if t.handleSSEEvent(ctx, data, sessionID, channel, chatID, sseErr, completionCh) {
++			if t.handleSSEEvent(ctx, data, sessionID, channel, chatID, sseErr, completionCh, &lastFeedback) {
 +				completionSeen = true
 +			}
 +		}
@@ -524,7 +558,7 @@ index 0000000..56662c6
 +
 +	if ctx.Err() == nil && len(dataLines) > 0 {
 +		data := strings.Join(dataLines, "\n")
-+		if t.handleSSEEvent(ctx, data, sessionID, channel, chatID, sseErr, completionCh) {
++		if t.handleSSEEvent(ctx, data, sessionID, channel, chatID, sseErr, completionCh, &lastFeedback) {
 +			completionSeen = true
 +		}
 +	}
@@ -546,7 +580,7 @@ index 0000000..56662c6
 +	}
 +}
 +
-+func (t *OpenCodeTaskTool) handleSSEEvent(ctx context.Context, data, sessionID, channel, chatID string, sseErr chan<- error, completionCh chan string) bool {
++func (t *OpenCodeTaskTool) handleSSEEvent(ctx context.Context, data, sessionID, channel, chatID string, sseErr chan<- error, completionCh chan string, lastFeedback *time.Time) bool {
 +	var event sseEvent
 +	if err := json.Unmarshal([]byte(data), &event); err != nil {
 +		logger.DebugCF("opencode", "Failed to parse SSE event", map[string]any{"error": err.Error()})
@@ -581,9 +615,130 @@ index 0000000..56662c6
 +		logger.DebugCF("opencode", "SSE event received", map[string]any{
 +			"type": event.Payload.Type,
 +		})
++	case "message.part.updated":
++		if time.Since(*lastFeedback) < 3*time.Second {
++			return false
++		}
++		var props messagePartProperties
++		if err := json.Unmarshal(event.Payload.Properties, &props); err != nil {
++			logger.DebugCF("opencode", "Failed to parse message.part.updated properties", map[string]any{"error": err.Error()})
++			return false
++		}
++		eventSID := props.Part.SessionID
++		if eventSID == "" {
++			eventSID = props.SessionID
++		}
++		if eventSID != sessionID {
++			return false
++		}
++		var content string
++		switch props.Part.Type {
++		case "tool-invocation":
++			if props.Part.ToolInvocation != nil && props.Part.ToolInvocation.ToolName != "" {
++				content = fmt.Sprintf("🤖 `opencode_task`\nUsing `%s`", sanitizeDiscordMentions(props.Part.ToolInvocation.ToolName))
++			} else {
++				content = "🤖 `opencode_task`\nUsing tool..."
++			}
++		case "text":
++			content = "🤖 `opencode_task`\nGenerating response..."
++		case "reasoning", "thinking":
++			content = "🤖 `opencode_task`\nThinking..."
++		default:
++			return false
++		}
++		t.publishToolFeedback(channel, chatID, content)
++		*lastFeedback = time.Now()
++	case "session.status":
++		if time.Since(*lastFeedback) < 3*time.Second {
++			return false
++		}
++		var props sessionStatusProperties
++		if err := json.Unmarshal(event.Payload.Properties, &props); err != nil {
++			logger.DebugCF("opencode", "Failed to parse session.status properties", map[string]any{"error": err.Error()})
++			return false
++		}
++		if props.SessionID != sessionID {
++			return false
++		}
++		var content string
++		switch props.Status.Type {
++		case "busy":
++			content = "🤖 `opencode_task`\nProcessing..."
++		case "retry":
++			content = fmt.Sprintf("🤖 `opencode_task`\n⚠️ Retrying (attempt %d)...", props.Status.Attempt)
++		default:
++			return false
++		}
++		t.publishToolFeedback(channel, chatID, content)
++		*lastFeedback = time.Now()
++	case "todo.updated":
++		if time.Since(*lastFeedback) < 3*time.Second {
++			return false
++		}
++		var props todoUpdatedProperties
++		if err := json.Unmarshal(event.Payload.Properties, &props); err != nil {
++			logger.DebugCF("opencode", "Failed to parse todo.updated properties", map[string]any{"error": err.Error()})
++			return false
++		}
++		if props.SessionID != sessionID {
++			return false
++		}
++		content := t.formatTodoProgress(props.Todos)
++		if content != "" {
++			t.publishToolFeedback(channel, chatID, content)
++			*lastFeedback = time.Now()
++		}
 +	}
 +
 +	return false
++}
++
++func (t *OpenCodeTaskTool) publishToolFeedback(channel, chatID, content string) {
++	if t.msgBus == nil || channel == "" || chatID == "" || strings.TrimSpace(content) == "" {
++		return
++	}
++	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
++	defer cancel()
++	if err := t.msgBus.PublishOutbound(ctx, bus.OutboundMessage{
++		Channel: channel,
++		ChatID:  chatID,
++		Content: content,
++		Context: bus.InboundContext{
++			Channel: channel,
++			ChatID:  chatID,
++			Raw:     map[string]string{"message_kind": "tool_feedback"},
++		},
++	}); err != nil {
++		logger.DebugCF("opencode", "Failed to publish tool feedback", map[string]any{
++			"error":   err.Error(),
++			"channel": channel,
++			"chat_id": chatID,
++		})
++	}
++}
++
++func (t *OpenCodeTaskTool) formatTodoProgress(todos []todoItem) string {
++	if len(todos) == 0 {
++		return ""
++	}
++	completed := 0
++	inProgress := 0
++	for _, todo := range todos {
++		switch todo.Status {
++		case "completed":
++			completed++
++		case "in_progress":
++			inProgress++
++		}
++	}
++	total := len(todos)
++	var status string
++	if inProgress > 0 {
++		status = fmt.Sprintf("Tasks: %d/%d done, %d in progress", completed, total, inProgress)
++	} else {
++		status = fmt.Sprintf("Tasks: %d/%d done", completed, total)
++	}
++	return fmt.Sprintf("🤖 `opencode_task`\n%s", status)
 +}
 +
 +func (t *OpenCodeTaskTool) handleQuestionAsked(raw json.RawMessage, sessionID, channel, chatID string, sseErr chan<- error) {
