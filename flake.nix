@@ -24,13 +24,13 @@
 
           picoclaw = pkgs.buildGoModule rec {
             pname = "picoclaw";
-            version = "0.2.8";
+            version = "0.2.9";
 
             src = pkgs.fetchFromGitHub {
               owner = "sipeed";
               repo = "picoclaw";
               rev = "v${version}";
-              hash = "sha256-PCPqdxXoXgJZduw3o5p6+heQ8wHxidcqGQBxqD3IdjQ=";
+              hash = "sha256-oMees7EKANS5dkMHIqAHfGcumrNMtTEEA+dmpl8/dLE=";
             };
 
             patches = [
