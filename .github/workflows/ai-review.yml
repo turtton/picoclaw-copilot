@@ -21,7 +21,7 @@ jobs:
       contents: write
       pull-requests: write
     env:
-      MODEL: github-copilot/claude-opus-4
+      MODEL: opencode-go/kimi-k2.6
       ALLOWED_PATHS: 'patches/ flake.nix flake.lock .upstream-version'
       SKIP_MARKER: '[skip ai-review]'
     steps:
@@ -100,25 +100,13 @@ jobs:
             echo "fixed=false" >> "$GITHUB_OUTPUT"
           fi
 
-      - name: Seed Copilot auth.json
+      - name: Check API key
         if: steps.skip-check.outputs.skip != 'true'
-        env:
-          COPILOT_ACCESS_TOKEN: ${{ secrets.COPILOT_ACCESS_TOKEN }}
-          COPILOT_REFRESH_TOKEN: ${{ secrets.COPILOT_REFRESH_TOKEN }}
         run: |
-          if [ -z "$COPILOT_ACCESS_TOKEN" ] || [ -z "$COPILOT_REFRESH_TOKEN" ]; then
-            echo "::warning::COPILOT_ACCESS_TOKEN / COPILOT_REFRESH_TOKEN not configured. Skipping AI review."
+          if [ -z "${{ secrets.OPENCODE_API_KEY }}" ]; then
+            echo "::warning::OPENCODE_API_KEY secret not configured. Skipping AI review."
             echo "NO_AI=true" >> "$GITHUB_ENV"
-            exit 0
           fi
-          AUTH_DIR="$HOME/.local/share/opencode"
-          mkdir -p "$AUTH_DIR"
-          jq -n \
-            --arg access "$COPILOT_ACCESS_TOKEN" \
-            --arg refresh "$COPILOT_REFRESH_TOKEN" \
-            '{"github-copilot": {type: "oauth", access: $access, refresh: $refresh, expires: 0}}' \
-            > "$AUTH_DIR/auth.json"
-          chmod 600 "$AUTH_DIR/auth.json"
 
       - name: Install opencode CLI
         if: steps.skip-check.outputs.skip != 'true' && env.NO_AI != 'true'
@@ -133,6 +121,7 @@ jobs:
           BUILD_EXIT: ${{ steps.build.outputs.BUILD_EXIT }}
           VENDOR_FIXED: ${{ steps.vendor-fix.outputs.fixed }}
           OPENCODE_MODEL: ${{ env.MODEL }}
+          OPENCODE_API_KEY: ${{ secrets.OPENCODE_API_KEY }}
         run: |
           # Determine if we need a fix or just evaluation
           if [ "$BUILD_STAGE" = "success" ] || [ "$VENDOR_FIXED" = "true" ]; then
