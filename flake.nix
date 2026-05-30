@@ -41,7 +41,7 @@
               ./patches/0005-fix-copilot-session-resume.patch
             ];
 
-            vendorHash = "sha256-LVfn2PsgqRVF/mLN/TLAENDEo+MnFc4DVG13+6dU+V4=";
+            vendorHash = "sha256-LjTLLeK2M8W34z1M11wKuBAoDI6ciCG3f4FRWAre/sY=";
             proxyVendor = true;
 
             env.CGO_ENABLED = "0";

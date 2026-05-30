@@ -1,11 +1,8 @@
 diff --git a/pkg/agent/agent_init.go b/pkg/agent/agent_init.go
-index d7bfc22..9469530 100644
 --- a/pkg/agent/agent_init.go
 +++ b/pkg/agent/agent_init.go
-@@ -350,5 +350,20 @@ func registerSharedTools(
- 		} else if (spawnEnabled || spawnStatusEnabled) && !cfg.Tools.IsToolEnabled("subagent") {
- 			logger.WarnCF("agent", "spawn/spawn_status tools require subagent to be enabled", nil)
- 		}
+@@ -373,3 +373,18 @@ func registerSharedTools(
+ 		warnOnUnknownAgentToolDeclarations(agentID, agent.Workspace, agent.Definition, agent.Tools)
 +
 +		if cfg.Tools.IsToolEnabled("opencode_task") && cfg.Tools.OpenCodeTask.ServerURL != "" {
 +			password := ""

@@ -27,6 +27,7 @@ jobs:
           ref: main
           fetch-depth: 0
           persist-credentials: true
+          token: ${{ secrets.PAT_TOKEN }}
 
       - name: Check for new release
         id: check
@@ -115,11 +116,47 @@ jobs:
           # Update .upstream-version
           echo "$NEW_VERSION" > .upstream-version
 
+      - name: Update vendorHash
+        if: steps.check.outputs.update_needed == 'true' && steps.branch-check.outputs.skip != 'true'
+        run: |
+          set -euo pipefail
+
+          # Use dummy hash to trigger build failure and extract correct hash
+          sed -i 's|vendorHash = "sha256-[^"]*"|vendorHash = "sha256-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="|' flake.nix
+
+          echo "Building goModules with dummy vendorHash to get correct hash..."
+          BUILD_OUTPUT=$(nix build .#picoclaw.goModules 2>&1 || true)
+
+          # Verify this is actually a hash mismatch (not a patch failure or other error)
+          if ! echo "$BUILD_OUTPUT" | grep -q 'hash mismatch in fixed-output derivation'; then
+            echo "::error::Build failed for a reason other than vendorHash mismatch"
+            echo "$BUILD_OUTPUT"
+            exit 1
+          fi
+
+          # Extract the correct hash from the error message
+          CORRECT_HASH=$(echo "$BUILD_OUTPUT" | grep -oP 'got:\s+\Ksha256-[A-Za-z0-9+/]+=*')
+
+          if [ -z "$CORRECT_HASH" ]; then
+            echo "::error::Failed to extract vendorHash from build output"
+            echo "$BUILD_OUTPUT"
+            exit 1
+          fi
+
+          if [ "$(echo "$CORRECT_HASH" | wc -l)" -ne 1 ]; then
+            echo "::error::Expected exactly one hash match, got multiple"
+            echo "$CORRECT_HASH"
+            exit 1
+          fi
+
+          echo "Correct vendorHash: $CORRECT_HASH"
+          sed -i "s|vendorHash = \"sha256-[^\"]*\"|vendorHash = \"$CORRECT_HASH\"|" flake.nix
+
       - name: Create or update PR branch
         if: steps.check.outputs.update_needed == 'true' && steps.branch-check.outputs.skip != 'true'
         env:
           NEW_VERSION: ${{ steps.check.outputs.latest }}
-          GH_TOKEN: ${{ github.token }}
+          GH_TOKEN: ${{ secrets.PAT_TOKEN }}
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
